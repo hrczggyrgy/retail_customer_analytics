@@ -172,6 +172,37 @@ def kpi_tile_row(metrics: list[dict]) -> None:
             help=m.get("help_text", "")
         )
 
+def get_period_context(period_params: dict) -> dict:
+    """Compute period boundaries from period_params.
+    
+    Returns dict with:
+        - current_start, current_end: the selected current period
+        - prior_start, prior_end: the comparison period (prior or yoy)
+        - period_len_days: length of current period in days
+        - compare_mode: "prior" or "yoy"
+    """
+    current_start = period_params["current_start"]
+    current_end = period_params["current_end"]
+    compare_mode = period_params.get("compare_mode", "prior")
+    
+    period_len = (current_end - current_start).days + 1
+    
+    if compare_mode == "prior":
+        prior_end = current_start - pd.Timedelta(days=1)
+        prior_start = prior_end - pd.Timedelta(days=period_len - 1)
+    else:  # yoy
+        prior_start = current_start - pd.DateOffset(years=1)
+        prior_end = current_end - pd.DateOffset(years=1)
+    
+    return {
+        "current_start": current_start,
+        "current_end": current_end,
+        "prior_start": prior_start,
+        "prior_end": prior_end,
+        "period_len_days": period_len,
+        "compare_mode": compare_mode,
+    }
+
 def period_selector_sidebar(df: pd.DataFrame) -> tuple[pd.Timestamp, pd.Timestamp, str]:
     """Global period selector in sidebar. Returns (current_start, current_end, compare_mode).
     
@@ -1235,17 +1266,9 @@ def tab_overview(R: dict[str, Any], raw_df: pd.DataFrame | None = None, period_p
     
     # Executive KPI Tiles with Period Comparison
     if raw_df is not None and period_params:
-        current_metrics = compute_period_metrics(raw_df, period_params["current_start"], period_params["current_end"])
-        
-        if period_params["compare_mode"] == "prior":
-            period_len = (period_params["current_end"] - period_params["current_start"]).days + 1
-            prior_end = period_params["current_start"] - pd.Timedelta(days=1)
-            prior_start = prior_end - pd.Timedelta(days=period_len - 1)
-        else:  # yoy
-            prior_start = period_params["current_start"] - pd.DateOffset(years=1)
-            prior_end = period_params["current_end"] - pd.DateOffset(years=1)
-        
-        prior_metrics = compute_period_metrics(raw_df, prior_start, prior_end)
+        ctx = get_period_context(period_params)
+        current_metrics = compute_period_metrics(raw_df, ctx["current_start"], ctx["current_end"])
+        prior_metrics = compute_period_metrics(raw_df, ctx["prior_start"], ctx["prior_end"])
         
         # Build KPI tiles with comparison
         kpi_metrics = [
@@ -1387,9 +1410,10 @@ def tab_overview(R: dict[str, Any], raw_df: pd.DataFrame | None = None, period_p
 def _plot_kpi_sparklines(raw_df: pd.DataFrame, period_params: dict) -> tuple | None:
     """Generate small multiples sparklines for key KPIs across recent periods."""
     try:
-        current_start = period_params["current_start"]
-        current_end = period_params["current_end"]
-        period_len = (current_end - current_start).days + 1
+        ctx = get_period_context(period_params)
+        current_start = ctx["current_start"]
+        current_end = ctx["current_end"]
+        period_len = ctx["period_len_days"]
         
         # Generate 6 periods going back
         n_periods = 6
@@ -2370,19 +2394,20 @@ def _plot_customer_value_tiers(rfm: pd.DataFrame) -> tuple | None:
         return None
 
 
-def _compute_retention_metrics(raw_df: pd.DataFrame, period_params: dict) -> dict:
-    """Compute retention, repeat purchase, reactivation metrics."""
+def _compute_retention_metrics(raw_df: pd.DataFrame, period_params: dict, inactivity_window_days: int = 90) -> dict:
+    """Compute retention, repeat purchase, reactivation metrics.
+    
+    Args:
+        raw_df: Transaction data
+        period_params: Period parameters from sidebar
+        inactivity_window_days: Days of inactivity before a customer is considered dormant
+    """
     try:
-        current_start = period_params["current_start"]
-        current_end = period_params["current_end"]
-        
-        if period_params["compare_mode"] == "prior":
-            period_len = (current_end - current_start).days + 1
-            prior_end = current_start - pd.Timedelta(days=1)
-            prior_start = prior_end - pd.Timedelta(days=period_len - 1)
-        else:
-            prior_start = current_start - pd.DateOffset(years=1)
-            prior_end = current_end - pd.DateOffset(years=1)
+        ctx = get_period_context(period_params)
+        current_start = ctx["current_start"]
+        current_end = ctx["current_end"]
+        prior_start = ctx["prior_start"]
+        prior_end = ctx["prior_end"]
         
         curr_df = raw_df[
             (raw_df["transaction_day"] >= current_start) & 
@@ -2404,8 +2429,23 @@ def _compute_retention_metrics(raw_df: pd.DataFrame, period_params: dict) -> dic
         retained = curr_customers & prior_customers
         retention_rate = len(retained) / len(prior_customers) if prior_customers else 0
         
-        # Reactivation: dormant customers (active before prior, not in prior, but in current)
-        dormant = all_time_customers - prior_customers
+        # Reactivation: customers dormant at period start who purchased in current period
+        # Dormant = no purchase in [current_start - inactivity_window_days, current_start)
+        dormancy_cutoff = current_start - pd.Timedelta(days=inactivity_window_days)
+        dormant_customers = set(
+            raw_df[
+                (raw_df["transaction_day"] < current_start) & 
+                (raw_df["transaction_day"] >= dormancy_cutoff)
+            ]["customer_id"].dropna().unique()
+        )
+        # Actually dormant = all_time_customers who did NOT purchase in the inactivity window
+        recently_active = set(
+            raw_df[
+                (raw_df["transaction_day"] < current_start) & 
+                (raw_df["transaction_day"] >= dormancy_cutoff)
+            ]["customer_id"].dropna().unique()
+        )
+        dormant = all_time_customers - recently_active
         reactivated = dormant & curr_customers
         reactivation_rate = len(reactivated) / len(dormant) if dormant else 0
         
@@ -2445,6 +2485,8 @@ def _compute_retention_metrics(raw_df: pd.DataFrame, period_params: dict) -> dic
             "new_customers": len(new_customers),
             "inactive_valuable_count": len(inactive_valuable),
             "inactive_valuable_revenue": hist_rev.loc[list(inactive_valuable)].sum() if inactive_valuable else 0,
+            "inactivity_window_days": inactivity_window_days,
+            "dormancy_cutoff": dormancy_cutoff,
         }
     except Exception:
         return {}
@@ -2495,16 +2537,11 @@ def _plot_retention_metrics(metrics: dict) -> tuple | None:
 def _plot_category_contribution(raw_df: pd.DataFrame, period_params: dict) -> tuple | None:
     """Category growth vs share scatter plot."""
     try:
-        current_start = period_params["current_start"]
-        current_end = period_params["current_end"]
-        
-        if period_params["compare_mode"] == "prior":
-            period_len = (current_end - current_start).days + 1
-            prior_end = current_start - pd.Timedelta(days=1)
-            prior_start = prior_end - pd.Timedelta(days=period_len - 1)
-        else:
-            prior_start = current_start - pd.DateOffset(years=1)
-            prior_end = current_end - pd.DateOffset(years=1)
+        ctx = get_period_context(period_params)
+        current_start = ctx["current_start"]
+        current_end = ctx["current_end"]
+        prior_start = ctx["prior_start"]
+        prior_end = ctx["prior_end"]
         
         curr_df = raw_df[
             (raw_df["transaction_day"] >= current_start) & 
@@ -2594,16 +2631,11 @@ def _plot_category_contribution(raw_df: pd.DataFrame, period_params: dict) -> tu
 def _plot_category_mix_trend(raw_df: pd.DataFrame, period_params: dict) -> tuple | None:
     """Stacked area chart of category revenue mix over time."""
     try:
-        current_start = period_params["current_start"]
-        current_end = period_params["current_end"]
-        
-        if period_params["compare_mode"] == "prior":
-            period_len = (current_end - current_start).days + 1
-            prior_end = current_start - pd.Timedelta(days=1)
-            prior_start = prior_end - pd.Timedelta(days=period_len - 1)
-        else:
-            prior_start = current_start - pd.DateOffset(years=1)
-            prior_end = current_end - pd.DateOffset(years=1)
+        ctx = get_period_context(period_params)
+        current_start = ctx["current_start"]
+        current_end = ctx["current_end"]
+        prior_start = ctx["prior_start"]
+        prior_end = ctx["prior_end"]
         
         # Use wider window for trend
         full_start = min(prior_start, current_start) - pd.Timedelta(days=90)
@@ -2664,8 +2696,9 @@ def _plot_category_mix_trend(raw_df: pd.DataFrame, period_params: dict) -> tuple
 def _plot_product_quadrant(raw_df: pd.DataFrame, period_params: dict, prod_summary: pd.DataFrame) -> tuple | None:
     """Quadrant scatter: basket penetration vs revenue per order."""
     try:
-        current_start = period_params["current_start"]
-        current_end = period_params["current_end"]
+        ctx = get_period_context(period_params)
+        current_start = ctx["current_start"]
+        current_end = ctx["current_end"]
         
         curr_df = raw_df[
             (raw_df["transaction_day"] >= current_start) & 
@@ -2750,16 +2783,11 @@ def _plot_product_quadrant(raw_df: pd.DataFrame, period_params: dict, prod_summa
 def _plot_product_rank_change(raw_df: pd.DataFrame, period_params: dict, prod_summary: pd.DataFrame) -> tuple | None:
     """Rank change chart: current vs prior period product revenue rank."""
     try:
-        current_start = period_params["current_start"]
-        current_end = period_params["current_end"]
-        
-        if period_params["compare_mode"] == "prior":
-            period_len = (current_end - current_start).days + 1
-            prior_end = current_start - pd.Timedelta(days=1)
-            prior_start = prior_end - pd.Timedelta(days=period_len - 1)
-        else:
-            prior_start = current_start - pd.DateOffset(years=1)
-            prior_end = current_end - pd.DateOffset(years=1)
+        ctx = get_period_context(period_params)
+        current_start = ctx["current_start"]
+        current_end = ctx["current_end"]
+        prior_start = ctx["prior_start"]
+        prior_end = ctx["prior_end"]
         
         curr_df = raw_df[
             (raw_df["transaction_day"] >= current_start) & 
@@ -2921,8 +2949,9 @@ def _plot_top_product_trends(raw_df: pd.DataFrame, period_params: dict, prod_sum
 def _compute_basket_analysis(raw_df: pd.DataFrame, period_params: dict, min_support: float = 0.01) -> dict:
     """Compute product pair associations: support, confidence, lift."""
     try:
-        current_start = period_params["current_start"]
-        current_end = period_params["current_end"]
+        ctx = get_period_context(period_params)
+        current_start = ctx["current_start"]
+        current_end = ctx["current_end"]
         
         curr_df = raw_df[
             (raw_df["transaction_day"] >= current_start) & 
@@ -3174,8 +3203,9 @@ def _plot_basket_top_pairs(pairs_df: pd.DataFrame, top_n: int = 15) -> tuple | N
 def _compute_anomalies(raw_df: pd.DataFrame, period_params: dict, window_days: int = 28, k: float = 2.0) -> dict:
     """Detect anomalies in daily KPIs using rolling mean ± k*std."""
     try:
-        current_start = period_params["current_start"]
-        current_end = period_params["current_end"]
+        ctx = get_period_context(period_params)
+        current_start = ctx["current_start"]
+        current_end = ctx["current_end"]
         
         # Use wider window for rolling stats
         full_start = current_start - pd.Timedelta(days=window_days * 2)
@@ -3203,7 +3233,7 @@ def _compute_anomalies(raw_df: pd.DataFrame, period_params: dict, window_days: i
         daily["units_per_order"] = daily["units"] / daily["orders"].replace(0, np.nan)
         daily["revenue_per_customer"] = daily["revenue"] / daily["customers"].replace(0, np.nan)
         
-        # Rolling stats
+        # Rolling stats - use LAGGED history so current day doesn't affect its own expected value
         metrics = ["revenue", "orders", "customers", "aov", "units_per_order", "revenue_per_customer"]
         anomalies = {}
         
@@ -3211,8 +3241,10 @@ def _compute_anomalies(raw_df: pd.DataFrame, period_params: dict, window_days: i
             if metric not in daily.columns or daily[metric].isna().all():
                 continue
             
-            rolling_mean = daily[metric].rolling(window=window_days, min_periods=7).mean()
-            rolling_std = daily[metric].rolling(window=window_days, min_periods=7).std()
+            # Shift by 1 so today's value doesn't influence today's expected range
+            history = daily[metric].shift(1)
+            rolling_mean = history.rolling(window=window_days, min_periods=7).mean()
+            rolling_std = history.rolling(window=window_days, min_periods=7).std()
             
             upper = rolling_mean + k * rolling_std
             lower = rolling_mean - k * rolling_std
@@ -3244,7 +3276,12 @@ def _compute_anomalies(raw_df: pd.DataFrame, period_params: dict, window_days: i
             if metric_anomalies:
                 anomalies[metric] = metric_anomalies
         
-        return {"daily": daily, "anomalies": anomalies}
+        # Store rolling stats for plotting
+        daily["expected"] = rolling_mean
+        daily["upper"] = upper
+        daily["lower"] = lower
+        
+        return {"daily": daily, "anomalies": anomalies, "current_start": current_start, "current_end": current_end}
     except Exception:
         return {}
 
@@ -3254,6 +3291,8 @@ def _plot_anomaly_timeseries(anomaly_data: dict, metric: str) -> tuple | None:
     try:
         daily = anomaly_data.get("daily", pd.DataFrame())
         anomalies = anomaly_data.get("anomalies", {}).get(metric, [])
+        current_start = anomaly_data.get("current_start")
+        current_end = anomaly_data.get("current_end")
         
         if daily.empty or metric not in daily.columns:
             return None
@@ -3264,9 +3303,16 @@ def _plot_anomaly_timeseries(anomaly_data: dict, metric: str) -> tuple | None:
         # Plot all data
         ax.plot(daily["transaction_day"], daily[metric], color="#1a202c", linewidth=1.5, label="Actual", alpha=0.7)
         
+        # Plot expected band if available
+        if "expected" in daily.columns and "upper" in daily.columns and "lower" in daily.columns:
+            ax.fill_between(daily["transaction_day"], daily["lower"], daily["upper"], 
+                           alpha=0.2, color='#2b6cb0', label='Expected Range (±2σ)')
+            ax.plot(daily["transaction_day"], daily["expected"], color="#2b6cb0", linewidth=1, linestyle='--', label="Expected", alpha=0.7)
+        
         # Highlight current period
-        curr_mask = (daily["transaction_day"] >= anomaly_data.get("current_start", daily["transaction_day"].min())) & \
-                    (daily["transaction_day"] <= anomaly_data.get("current_end", daily["transaction_day"].max()))
+        if current_start and current_end:
+            curr_mask = (daily["transaction_day"] >= current_start) & (daily["transaction_day"] <= current_end)
+            ax.axvspan(current_start, current_end, alpha=0.1, color='yellow', label='Current Period')
         
         # Mark anomalies
         if anomalies:
@@ -3281,7 +3327,7 @@ def _plot_anomaly_timeseries(anomaly_data: dict, metric: str) -> tuple | None:
                            xytext=(0, 15), textcoords='offset points',
                            ha='center', fontsize=8, color='#e53e3e', fontweight='bold')
         
-        ax.set_title(f"{metric.replace('_', ' ').title()} - Anomaly Detection", fontsize=13, fontweight='bold', pad=15)
+        ax.set_title(f"{metric.replace('_', ' ').title()} - Anomaly Detection (Lagged Baseline)", fontsize=13, fontweight='bold', pad=15)
         ax.set_ylabel(metric.replace('_', ' ').title(), fontsize=10)
         ax.legend(loc='upper left', fontsize=9)
         ax.spines['top'].set_visible(False)
@@ -3479,16 +3525,11 @@ def _plot_drilldown_path(raw_df: pd.DataFrame, period_params: dict,
                          dimension: str, metric: str, top_n: int = 10) -> tuple | None:
     """Drill-down bar chart: show metric by dimension for current vs prior."""
     try:
-        current_start = period_params["current_start"]
-        current_end = period_params["current_end"]
-        
-        if period_params["compare_mode"] == "prior":
-            period_len = (current_end - current_start).days + 1
-            prior_end = current_start - pd.Timedelta(days=1)
-            prior_start = prior_end - pd.Timedelta(days=period_len - 1)
-        else:
-            prior_start = current_start - pd.DateOffset(years=1)
-            prior_end = current_end - pd.DateOffset(years=1)
+        ctx = get_period_context(period_params)
+        current_start = ctx["current_start"]
+        current_end = ctx["current_end"]
+        prior_start = ctx["prior_start"]
+        prior_end = ctx["prior_end"]
         
         curr_df = raw_df[
             (raw_df["transaction_day"] >= current_start) & 
@@ -3711,19 +3752,25 @@ def tab_cohort(R: dict[str, Any], raw_df: pd.DataFrame | None = None, period_par
     if raw_df is not None and period_params:
         st.markdown("---")
         st.subheader("Retention & Loyalty Metrics")
-        retention_metrics = _compute_retention_metrics(raw_df, period_params)
+        # Use 90-day inactivity window (configurable)
+        inactivity_window = 90
+        retention_metrics = _compute_retention_metrics(raw_df, period_params, inactivity_window_days=inactivity_window)
         if retention_metrics:
             fig, ax = _plot_retention_metrics(retention_metrics)
             if fig:
                 chart_card(fig, f"Retention: {retention_metrics['retention_rate']*100:.1f}% | Reactivation: {retention_metrics['reactivation_rate']*100:.1f}% | Repeat Purchase Rate: {retention_metrics['repeat_purchase_rate']*100:.1f}%")
             
+            # Show inactivity window definition
+            st.caption(f"Reactivation uses {inactivity_window}-day inactivity window before period start (dormant = no purchase since {retention_metrics.get('dormancy_cutoff', 'N/A')}).")
+            
             # Key metrics in columns
-            col1, col2, col3, col4, col5 = st.columns(5)
+            col1, col2, col3, col4, col5, col6 = st.columns(6)
             col1.metric("Retention Rate", f"{retention_metrics['retention_rate']*100:.1f}%")
             col2.metric("Reactivation Rate", f"{retention_metrics['reactivation_rate']*100:.1f}%")
             col3.metric("Repeat Purchase Rate", f"{retention_metrics['repeat_purchase_rate']*100:.1f}%")
             col4.metric("Repeat Revenue Share", f"{retention_metrics['repeat_revenue_share']*100:.1f}%")
             col5.metric("New Customer Share", f"{retention_metrics['new_customer_share']*100:.1f}%")
+            col6.metric("Inactivity Window", f"{inactivity_window} days")
             
             # Inactive valuable customers
             if retention_metrics.get('inactive_valuable_count', 0) > 0:
