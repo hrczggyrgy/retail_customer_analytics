@@ -84,6 +84,8 @@ def kpi_row(metrics: list[tuple[str, str, str | None]]) -> None:
     """Render a row of KPI metrics with optional deltas.
     metrics: list of (label, value, delta) tuples
     """
+    if not metrics:
+        return
     cols = st.columns(len(metrics))
     for col, (label, value, delta) in zip(cols, metrics):
         col.metric(label, value, delta=delta)
@@ -522,6 +524,17 @@ def data_step(p: dict[str, Any]) -> tuple[pd.DataFrame | None, str | None]:
         return None, "Each required column must map to a different source column."
     df = raw[used].copy()
     df.columns = REQUIRED
+    
+    # Convert types to match expected schema
+    df["customer_id"] = df["customer_id"].astype("string")
+    df["transaction_id"] = df["transaction_id"].astype("string")
+    df["product_id"] = df["product_id"].astype("string")
+    df["product_description"] = df["product_description"].astype("string")
+    df["department"] = df["department"].astype("string")
+    df["category"] = df["category"].astype("string")
+    df["price"] = pd.to_numeric(df["price"], errors="coerce")
+    df["quantity"] = pd.to_numeric(df["quantity"], errors="coerce")
+    
     return df, None
 
 
