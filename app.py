@@ -4026,8 +4026,11 @@ def main() -> None:
                 shutil.rmtree(old["work"], ignore_errors=True)
             st.session_state["result"] = R
             st.session_state["source_label"] = p["source"]
-            # Store raw data for period selection and RFM
-            st.session_state["raw_df"] = df.copy()
+            # Store raw data for period selection and RFM - add transaction_day column
+            raw_df_to_store = df.copy()
+            raw_df_to_store["transaction_date"] = pd.to_datetime(raw_df_to_store["transaction_date"])
+            raw_df_to_store["transaction_day"] = raw_df_to_store["transaction_date"].dt.normalize()
+            st.session_state["raw_df"] = raw_df_to_store
         except Exception as exc:
             st.error(f"{type(exc).__name__}: {exc}")
     R = st.session_state.get("result")
