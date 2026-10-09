@@ -45,7 +45,7 @@ if str(APP_DIR) not in sys.path:
 REQUIRED = ["customer_id", "transaction_date", "transaction_id", "product_id", "product_description",
             "department", "category", "price", "quantity"]
 
-TABS = ["1 Overview", "2 Trust", "3 Customers", "4 Behaviour", "5 Products", "6 RFM Analysis", "7 Cohort Retention", "8 Explorer", "9 Data"]
+TABS = ["1 Overview", "2 Trust", "3 Customers", "4 Retention & Behaviour", "5 Products & Baskets", "6 Explorer & Data"]
 CHARTS_BY_TAB = {
     "trust": ["01_model_validation", "02_calibration", "05_cluster_selection"],
     "customers": ["03_customer_map", "04_segment_value", "06_rfm_segments", "09_revenue_concentration", "18_lorenz_segments", "19_action_quadrant"],
@@ -133,6 +133,13 @@ def segment_color(label: str) -> str:
 # ============================================================
 # Executive Overview Helpers - Phase 1 & 2
 # ============================================================
+# Per-metric favorable direction for delta coloring
+FAVORABLE_DIRECTION = {
+    "Revenue": "up", "Orders": "up", "Active Customers": "up",
+    "AOV": "up", "Units/Order": "up", "Revenue/Customer": "up",
+    "Returns": "down", "Churn": "down", "Return Rate": "down"
+}
+
 def kpi_tile_row(metrics: list[dict]) -> None:
     """Render a row of executive KPI tiles with current, prior, change, pct_change.
     
@@ -152,11 +159,10 @@ def kpi_tile_row(metrics: list[dict]) -> None:
     cols = st.columns(n)
     
     for col, m in zip(cols, metrics):
-        delta_color = "normal"
-        if m.get("trend") == "up":
-            delta_color = "normal"
-        elif m.get("trend") == "down":
-            delta_color = "inverse"
+        # Use per-metric favorable direction instead of assuming "up" is always good
+        favorable = FAVORABLE_DIRECTION.get(m.get("label", ""), "up")
+        trend = m.get("trend", "neutral")
+        delta_color = "normal" if trend == favorable else ("inverse" if trend != "neutral" else "off")
             
         col.metric(
             label=m["label"],
@@ -604,11 +610,15 @@ def plot_rfm_segments(rfm: pd.DataFrame) -> tuple:
     return fig, axes
 
 def plot_pareto(df: pd.DataFrame, value_col: str, label_col: str, top_n: int = 20, title: str = "Pareto Analysis") -> tuple:
-    """Create Pareto chart with cumulative percentage."""
+    """Create Pareto chart with cumulative percentage of TOTAL business."""
     import matplotlib.pyplot as plt
     
+    # Calculate total from FULL population before truncating
+    total_value = df[value_col].sum()
+    
     pareto = df.nlargest(top_n, value_col).sort_values(value_col, ascending=False).reset_index(drop=True)
-    pareto["cum_pct"] = pareto[value_col].cumsum() / pareto[value_col].sum() * 100
+    # Cumulative share of TOTAL business, not just displayed subset
+    pareto["cum_pct"] = pareto[value_col].cumsum() / total_value * 100
     pareto["rank"] = range(1, len(pareto) + 1)
     
     fig, ax1 = plt.subplots(figsize=(12, 5))
@@ -622,13 +632,19 @@ def plot_pareto(df: pd.DataFrame, value_col: str, label_col: str, top_n: int = 2
     ax1.set_xticks(range(len(pareto)))
     ax1.set_xticklabels([str(l)[:20] for l in pareto[label_col]], rotation=45, ha='right', fontsize=8)
     
-    # Cumulative line
+    # Cumulative line - shows share of TOTAL business
     ax2 = ax1.twinx()
     ax2.plot(range(len(pareto)), pareto["cum_pct"], color="#e53e3e", marker='o', linewidth=2, markersize=4)
-    ax2.set_ylabel("Cumulative %", fontsize=10, color="#e53e3e")
+    ax2.set_ylabel("Cumulative % of Total Business", fontsize=10, color="#e53e3e")
     ax2.tick_params(axis='y', labelcolor="#e53e3e")
     ax2.axhline(y=80, color='gray', linestyle='--', alpha=0.5, linewidth=1)
     ax2.text(len(pareto)-1, 82, "80% threshold", fontsize=8, color='gray')
+    
+    # Add note about total share captured
+    total_share = pareto["cum_pct"].iloc[-1] if len(pareto) > 0 else 0
+    ax1.text(0.02, 0.98, f"Top {len(pareto)} = {total_share:.1f}% of total", 
+             transform=ax1.transAxes, fontsize=9, va='top', ha='left',
+             bbox=dict(boxstyle='round', facecolor='white', alpha=0.8, edgecolor='gray'))
     
     ax1.set_title(title, fontsize=13, fontweight='bold', pad=15)
     ax1.spines['top'].set_visible(False)
@@ -685,7 +701,8 @@ def plot_cohort_retention_heatmap(cohort_data: pd.DataFrame) -> tuple:
     ax.set_ylabel("Cohort (First Purchase Month)", fontsize=10)
     ax.set_title("Cohort Retention Heatmap", fontsize=13, fontweight='bold', pad=15)
     
-    cbar = plt.colorbar(im, ax=ax, format='%.0f%%')
+    from matplotlib.ticker import PercentFormatter
+    cbar = plt.colorbar(im, ax=ax, format=PercentFormatter(xmax=1.0))
     cbar.set_label("Retention Rate", fontsize=9)
     
     plt.tight_layout()
@@ -1905,11 +1922,12 @@ def tab_rfm(R: dict[str, Any], raw_df: pd.DataFrame | None = None, period_params
         rfm_sorted["cum_revenue_pct"] = rfm_sorted["monetary"].cumsum() / rfm_sorted["monetary"].sum() * 100
         rfm_sorted["cum_customer_pct"] = np.arange(1, n+1) / n * 100
         
+        # Exclusive bands with correct labels
         tiers = [
             ("Top 1%", 0, 1),
-            ("Top 5%", 1, 5),
-            ("Top 10%", 5, 10),
-            ("Top 20%", 10, 20),
+            ("Next 4%", 1, 5),
+            ("Next 5%", 5, 10),
+            ("Next 10%", 10, 20),
             ("Middle 50%", 20, 70),
             ("Bottom 30%", 70, 100),
         ]
@@ -2169,8 +2187,13 @@ def _plot_customer_pareto(rfm: pd.DataFrame) -> tuple | None:
         if "monetary" not in rfm.columns:
             return None
         
+        # Total revenue from FULL customer population
+        total_revenue = rfm["monetary"].sum()
+        n_total = len(rfm)
+        
         pareto = rfm.nlargest(min(200, len(rfm)), "monetary").sort_values("monetary", ascending=False).reset_index(drop=True)
-        pareto["cum_pct"] = pareto["monetary"].cumsum() / pareto["monetary"].sum() * 100
+        # Cumulative share of TOTAL business, not just displayed subset
+        pareto["cum_pct"] = pareto["monetary"].cumsum() / total_revenue * 100
         pareto["rank"] = range(1, len(pareto) + 1)
         
         import matplotlib.pyplot as plt
@@ -2185,16 +2208,21 @@ def _plot_customer_pareto(rfm: pd.DataFrame) -> tuple | None:
         
         ax2 = ax1.twinx()
         ax2.plot(range(len(pareto)), pareto["cum_pct"], color="#e53e3e", marker='o', linewidth=2, markersize=3)
-        ax2.set_ylabel("Cumulative %", fontsize=10, color="#e53e3e")
+        ax2.set_ylabel("Cumulative % of Total Revenue", fontsize=10, color="#e53e3e")
         ax2.tick_params(axis='y', labelcolor="#e53e3e")
         ax2.axhline(y=80, color='gray', linestyle='--', alpha=0.5, linewidth=1)
         ax2.text(len(pareto)-1, 82, "80% threshold", fontsize=8, color='gray')
         
-        # Add reference lines for top tiers
-        n = len(pareto)
+        # Add note about total share captured
+        total_share = pareto["cum_pct"].iloc[-1] if len(pareto) > 0 else 0
+        ax1.text(0.02, 0.98, f"Top {len(pareto)} of {n_total} = {total_share:.1f}% of total", 
+                 transform=ax1.transAxes, fontsize=9, va='top', ha='left',
+                 bbox=dict(boxstyle='round', facecolor='white', alpha=0.8, edgecolor='gray'))
+        
+        # Add reference lines for top tiers using FULL population count
         for pct, label in [(1, "Top 1%"), (5, "Top 5%"), (10, "Top 10%"), (20, "Top 20%")]:
-            idx = int(n * pct / 100)
-            if idx < n:
+            idx = int(n_total * pct / 100)
+            if idx < len(pareto):
                 ax1.axvline(x=idx, color='gray', linestyle=':', alpha=0.5, linewidth=1)
                 ax1.text(idx, ax1.get_ylim()[1]*0.95, label, fontsize=7, rotation=90, va='top', ha='right', color='gray')
         
@@ -2232,14 +2260,22 @@ def _plot_customer_lorenz(rfm: pd.DataFrame) -> tuple | None:
         # Shade area
         ax.fill_between(x, y, x, alpha=0.1, color="#2b6cb0")
         
-        # Reference points
+        # Reference points - vals sorted ascending, so y[idx] = bottom share
+        # Top share = 1 - bottom share
         for pct in [0.5, 0.8, 0.9, 0.95, 0.99]:
             idx = int(pct * len(x))
             if idx < len(x):
                 ax.plot(x[idx], y[idx], 'o', color="#e53e3e", markersize=4)
-                ax.annotate(f"Top {int((1-pct)*100)}%: {y[idx]*100:.1f}% revenue", 
+                top_share = (1 - y[idx]) * 100
+                ax.annotate(f"Top {int((1-pct)*100)}%: {top_share:.1f}% revenue", 
                            xy=(x[idx], y[idx]), xytext=(5, -15), textcoords='offset points',
                            fontsize=8, color="#e53e3e")
+        
+        # Disclosure about excluded non-positive monetary
+        n_excluded = len(rfm) - len(vals)
+        if n_excluded > 0:
+            ax.text(0.02, 0.02, f"Note: {n_excluded} customers with non-positive monetary excluded", 
+                   transform=ax.transAxes, fontsize=7, color='gray', va='bottom')
         
         ax.set_xlabel("Cumulative Share of Customers", fontsize=10)
         ax.set_ylabel("Cumulative Share of Revenue", fontsize=10)
@@ -2268,12 +2304,12 @@ def _plot_customer_value_tiers(rfm: pd.DataFrame) -> tuple | None:
         rfm_sorted["cum_revenue_pct"] = rfm_sorted["monetary"].cumsum() / rfm_sorted["monetary"].sum() * 100
         rfm_sorted["cum_customer_pct"] = np.arange(1, n+1) / n * 100
         
-        # Define tiers
+        # Define tiers - using exclusive bands with correct labels
         tiers = [
             ("Top 1%", 0, 1),
-            ("Top 5%", 1, 5),
-            ("Top 10%", 5, 10),
-            ("Top 20%", 10, 20),
+            ("Next 4%", 1, 5),
+            ("Next 5%", 5, 10),
+            ("Next 10%", 10, 20),
             ("Middle 50%", 20, 70),
             ("Bottom 30%", 70, 100),
         ]
@@ -2303,7 +2339,7 @@ def _plot_customer_value_tiers(rfm: pd.DataFrame) -> tuple | None:
         colors = ["#2b6cb0", "#2f855a", "#38a169", "#4299e1", "#a0aec0", "#718096"]
         bars1 = axes[0].barh(range(len(tier_df)), tier_df["customer_pct"], color=colors[:len(tier_df)], edgecolor='white')
         axes[0].set_xlabel("Share of Customers (%)", fontsize=10)
-        axes[0].set_title("Customer Count by Value Tier", fontsize=12, fontweight='bold')
+        axes[0].set_title("Customer Count by Value Tier (Exclusive Bands)", fontsize=12, fontweight='bold')
         axes[0].set_yticks(range(len(tier_df)))
         axes[0].set_yticklabels(tier_df["tier"], fontsize=9)
         axes[0].invert_yaxis()
@@ -2317,7 +2353,7 @@ def _plot_customer_value_tiers(rfm: pd.DataFrame) -> tuple | None:
         # Revenue share
         bars2 = axes[1].barh(range(len(tier_df)), tier_df["revenue_pct"], color=colors[:len(tier_df)], edgecolor='white')
         axes[1].set_xlabel("Share of Revenue (%)", fontsize=10)
-        axes[1].set_title("Revenue by Value Tier", fontsize=12, fontweight='bold')
+        axes[1].set_title("Revenue by Value Tier (Exclusive Bands)", fontsize=12, fontweight='bold')
         axes[1].set_yticks(range(len(tier_df)))
         axes[1].set_yticklabels(tier_df["tier"], fontsize=9)
         axes[1].invert_yaxis()
@@ -2390,11 +2426,11 @@ def _compute_retention_metrics(raw_df: pd.DataFrame, period_params: dict) -> dic
         total_revenue = all_purchases["revenue"].sum()
         repeat_revenue_share = repeat_revenue / total_revenue if total_revenue > 0 else 0
         
-        # Churned valuable: top 20% by historical revenue, not in current
+        # Inactive valuable: top 20% by historical revenue, not in current
         hist_rev = all_purchases.groupby("customer_id")["revenue"].sum().sort_values(ascending=False)
         top_20_pct = int(len(hist_rev) * 0.2)
         valuable_cust = set(hist_rev.head(top_20_pct).index) if top_20_pct > 0 else set()
-        churned_valuable = valuable_cust - curr_customers
+        inactive_valuable = valuable_cust - curr_customers
         
         return {
             "retention_rate": retention_rate,
@@ -2407,8 +2443,8 @@ def _compute_retention_metrics(raw_df: pd.DataFrame, period_params: dict) -> dic
             "retained": len(retained),
             "reactivated": len(reactivated),
             "new_customers": len(new_customers),
-            "churned_valuable_count": len(churned_valuable),
-            "churned_valuable_revenue": hist_rev.loc[list(churned_valuable)].sum() if churned_valuable else 0,
+            "inactive_valuable_count": len(inactive_valuable),
+            "inactive_valuable_revenue": hist_rev.loc[list(inactive_valuable)].sum() if inactive_valuable else 0,
         }
     except Exception:
         return {}
@@ -2530,16 +2566,18 @@ def _plot_category_contribution(raw_df: pd.DataFrame, period_params: dict) -> tu
         ax.set_ylabel("Revenue Share (%)", fontsize=10)
         ax.set_title("Category Performance: Growth vs Share", fontsize=13, fontweight='bold', pad=15)
         
-        # Quadrant labels
-        xlim = ax.get_xlim()
-        ylim = ax.get_ylim()
-        ax.text(xlim[1]*0.95, ylim[1]*0.95, "SCALE DRIVERS\n(High Share, High Growth)", 
+        # Quadrant labels - X=Growth, Y=Share (using axes coordinates for reliability)
+        # Top-right: High Growth, High Share = Scale Drivers
+        # Top-left: High Growth, Low Share = Emerging Stars
+        # Bottom-right: Low Growth, High Share = Declining Priorities
+        # Bottom-left: Low Growth, Low Share = Small Declines
+        ax.text(0.95, 0.95, "Scale Drivers\n(High Share, High Growth)", transform=ax.transAxes,
                ha='right', va='top', fontsize=9, bbox=dict(boxstyle='round', facecolor='#c6f6d5', alpha=0.7))
-        ax.text(xlim[0]*0.95, ylim[1]*0.95, "EMERGING\n(Low Share, High Growth)", 
+        ax.text(0.05, 0.95, "Emerging Stars\n(Low Share, High Growth)", transform=ax.transAxes,
                ha='left', va='top', fontsize=9, bbox=dict(boxstyle='round', facecolor='#bee3f8', alpha=0.7))
-        ax.text(xlim[1]*0.95, ylim[0]*1.05, "DECLINING PRIORITIES\n(High Share, Low Growth)", 
+        ax.text(0.95, 0.05, "Declining Priorities\n(High Share, Low Growth)", transform=ax.transAxes,
                ha='right', va='bottom', fontsize=9, bbox=dict(boxstyle='round', facecolor='#fed7d7', alpha=0.7))
-        ax.text(xlim[0]*0.95, ylim[0]*1.05, "SMALL DECLINES\n(Low Share, Low Growth)", 
+        ax.text(0.05, 0.05, "Small Declines\n(Low Share, Low Growth)", transform=ax.transAxes,
                ha='left', va='bottom', fontsize=9, bbox=dict(boxstyle='round', facecolor='#feebc8', alpha=0.7))
         
         plt.colorbar(scatter, ax=ax, label="Revenue Change")
@@ -2681,15 +2719,19 @@ def _plot_product_quadrant(raw_df: pd.DataFrame, period_params: dict, prod_summa
         ax.axvline(med_pen, color='gray', linestyle='--', alpha=0.5)
         ax.axhline(med_rev, color='gray', linestyle='--', alpha=0.5)
         
-        # Quadrant labels
-        ax.text(0.95, 0.95, "PREMIUM ADD-ONS\n(High Rev/Order, Low Penetration)", transform=ax.transAxes,
-               ha='right', va='top', fontsize=9, bbox=dict(boxstyle='round', facecolor='#bee3f8', alpha=0.7))
-        ax.text(0.95, 0.05, "TRAFFIC DRIVERS\n(High Rev/Order, High Penetration)", transform=ax.transAxes,
-               ha='right', va='bottom', fontsize=9, bbox=dict(boxstyle='round', facecolor='#c6f6d5', alpha=0.7))
-        ax.text(0.05, 0.95, "LOW IMPACT\n(Low Rev/Order, Low Penetration)", transform=ax.transAxes,
-               ha='left', va='top', fontsize=9, bbox=dict(boxstyle='round', facecolor='#feebc8', alpha=0.7))
-        ax.text(0.05, 0.05, "VOLUME DRIVERS\n(Low Rev/Order, High Penetration)", transform=ax.transAxes,
-               ha='left', va='bottom', fontsize=9, bbox=dict(boxstyle='round', facecolor='#fed7d7', alpha=0.7))
+        # Quadrant labels - X=penetration, Y=rev/order
+        # Top-left (low pen, high rev): Niche high-value
+        # Top-right (high pen, high rev): Broad-reach high-value
+        # Bottom-left (low pen, low rev): Low-impact
+        # Bottom-right (high pen, low rev): High-volume, low-value
+        ax.text(0.05, 0.95, "Niche High-Value\n(Low Penetration, High Rev/Order)", transform=ax.transAxes,
+               ha='left', va='top', fontsize=9, bbox=dict(boxstyle='round', facecolor='#bee3f8', alpha=0.7))
+        ax.text(0.95, 0.95, "Broad-Reach High-Value\n(High Penetration, High Rev/Order)", transform=ax.transAxes,
+               ha='right', va='top', fontsize=9, bbox=dict(boxstyle='round', facecolor='#c6f6d5', alpha=0.7))
+        ax.text(0.05, 0.05, "Low-Impact\n(Low Penetration, Low Rev/Order)", transform=ax.transAxes,
+               ha='left', va='bottom', fontsize=9, bbox=dict(boxstyle='round', facecolor='#feebc8', alpha=0.7))
+        ax.text(0.95, 0.05, "High-Volume, Low-Value\n(High Penetration, Low Rev/Order)", transform=ax.transAxes,
+               ha='right', va='bottom', fontsize=9, bbox=dict(boxstyle='round', facecolor='#fed7d7', alpha=0.7))
         
         ax.set_xlabel("Basket Penetration (% of orders)", fontsize=10)
         ax.set_ylabel("Revenue per Order", fontsize=10)
@@ -3314,13 +3356,13 @@ def _generate_action_matrix(rfm: pd.DataFrame, basket_data: dict, anomaly_data: 
     actions = []
     
     try:
-        # 1. High-value churned customers
-        if retention_metrics and retention_metrics.get("churned_valuable_count", 0) > 0:
+        # 1. High-value inactive customers
+        if retention_metrics and retention_metrics.get("inactive_valuable_count", 0) > 0:
             actions.append({
                 "priority": 1,
                 "category": "Retention",
-                "title": f"Win-back {retention_metrics['churned_valuable_count']} high-value churned customers",
-                "impact": fmt_currency(retention_metrics['churned_valuable_revenue']),
+                "title": f"Win-back {retention_metrics['inactive_valuable_count']} high-value inactive customers",
+                "impact": fmt_currency(retention_metrics['inactive_valuable_revenue']),
                 "evidence": f"Top 20% by historical revenue not active in current period",
                 "action": "Personal outreach with tailored offers; test against holdout group",
                 "metric_to_track": "Reactivation rate, revenue recovered"
@@ -3599,11 +3641,12 @@ def _plot_drilldown_path(raw_df: pd.DataFrame, period_params: dict,
         rfm_sorted["cum_revenue_pct"] = rfm_sorted["monetary"].cumsum() / rfm_sorted["monetary"].sum() * 100
         rfm_sorted["cum_customer_pct"] = np.arange(1, n+1) / n * 100
         
+        # Exclusive bands with correct labels
         tiers = [
             ("Top 1%", 0, 1),
-            ("Top 5%", 1, 5),
-            ("Top 10%", 5, 10),
-            ("Top 20%", 10, 20),
+            ("Next 4%", 1, 5),
+            ("Next 5%", 5, 10),
+            ("Next 10%", 10, 20),
             ("Middle 50%", 20, 70),
             ("Bottom 30%", 70, 100),
         ]
@@ -3682,9 +3725,9 @@ def tab_cohort(R: dict[str, Any], raw_df: pd.DataFrame | None = None, period_par
             col4.metric("Repeat Revenue Share", f"{retention_metrics['repeat_revenue_share']*100:.1f}%")
             col5.metric("New Customer Share", f"{retention_metrics['new_customer_share']*100:.1f}%")
             
-            # Churned valuable customers
-            if retention_metrics.get('churned_valuable_count', 0) > 0:
-                st.warning(f"⚠️ **{retention_metrics['churned_valuable_count']} high-value customers (top 20%) have churned** - Lost historical revenue: {fmt_currency(retention_metrics['churned_valuable_revenue'])}")
+            # Inactive valuable customers
+            if retention_metrics.get('inactive_valuable_count', 0) > 0:
+                st.warning(f"⚠️ **{retention_metrics['inactive_valuable_count']} high-value customers (top 20%) inactive** — Historical revenue associated: {fmt_currency(retention_metrics['inactive_valuable_revenue'])}")
     
     # Cohort size and revenue
     st.markdown("---")
@@ -3782,7 +3825,15 @@ def tab_product_pareto(R: dict[str, Any], raw_df: pd.DataFrame | None = None, pe
         st.subheader("Product Portfolio: Penetration vs Revenue per Order")
         quad_fig = _plot_product_quadrant(raw_df, period_params, prod_summary)
         if quad_fig:
-            chart_card(quad_fig[0], "Quadrants: Traffic Drivers (high penetration, high rev/order), Premium Add-ons (low penetration, high rev/order), Volume Drivers (high penetration, low rev/order), Low Impact (low both).")
+            chart_card(quad_fig[0], "X=Basket Penetration, Y=Revenue per Order. Top-left=Niche High-Value, Top-right=Broad-Reach High-Value, Bottom-left=Low-Impact, Bottom-right=High-Volume Low-Value.")
+
+    # Category Performance: Growth vs Share
+    if raw_df is not None and period_params:
+        st.markdown("---")
+        st.subheader("Category Performance: Growth vs Share")
+        cat_fig = _plot_category_contribution(raw_df, period_params)
+        if cat_fig:
+            chart_card(cat_fig[0], "X=Revenue Growth %, Y=Revenue Share %. Top-right=Scale Drivers, Top-left=Emerging Stars, Bottom-right=Declining Priorities, Bottom-left=Small Declines. Vertical line=Total Business Growth.")
     
     # Product Movers - period over period
     if raw_df is not None and period_params:
@@ -3947,12 +3998,25 @@ def main() -> None:
     
     st.caption(f"Showing results for: {st.session_state.get('source_label', 'data')}  |  {R['rows']:,} rows")
     
+    # Wrapper functions for consolidated tabs
+    def tab_products_and_baskets(R, raw_df, period_params):
+        """Combined Products & Baskets tab."""
+        tab_product_pareto(R, raw_df, period_params)
+        st.markdown("---")
+        tab_products(R, raw_df, period_params)
+    
+    def tab_explorer_and_data(R, raw_df, period_params):
+        """Combined Explorer & Data tab."""
+        tab_explorer(R, raw_df, period_params)
+        st.markdown("---")
+        tab_data(R, raw_df, period_params)
+    
     # Prepare raw data for tabs
     raw_df = st.session_state.get("raw_df")
     
-    # Updated tabs with new sections
+    # Updated tabs with new sections (6 tabs)
     tabs = st.tabs(TABS)
-    tab_functions = [tab_overview, tab_trust, tab_customers, tab_behaviour, tab_product_pareto, tab_rfm, tab_cohort, tab_explorer, tab_data]
+    tab_functions = [tab_overview, tab_trust, tab_customers, tab_behaviour, tab_products_and_baskets, tab_explorer_and_data]
     for tab, fn in zip(tabs, tab_functions):
         with tab:
             fn(R, raw_df, period_params)
