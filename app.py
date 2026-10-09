@@ -1623,7 +1623,7 @@ def _render_executive_narrative(current_metrics: dict, prior_metrics: dict, peri
     st.markdown(narrative)
 
 
-def tab_trust(R: dict[str, Any]) -> None:
+def tab_trust(R: dict[str, Any], raw_df: pd.DataFrame | None = None, period_params: dict | None = None) -> None:
     st.header("Can we trust it?")
     st.caption("The models were fitted on older data and scored on the following period, against simple baselines.")
     
@@ -1687,7 +1687,7 @@ def segment_profile(cf: pd.DataFrame) -> pd.DataFrame:
     return out.sort_values("total_expected_revenue", ascending=False)
 
 
-def tab_customers(R: dict[str, Any]) -> None:
+def tab_customers(R: dict[str, Any], raw_df: pd.DataFrame | None = None, period_params: dict | None = None) -> None:
     st.header("Customers")
     st.caption("Question answered here: who are the customers, how active are they, and where does future revenue sit?")
     
@@ -1741,7 +1741,7 @@ def tab_customers(R: dict[str, Any]) -> None:
                 show_df(pretty(t))
 
 
-def tab_behaviour(R: dict[str, Any]) -> None:
+def tab_behaviour(R: dict[str, Any], raw_df: pd.DataFrame | None = None, period_params: dict | None = None) -> None:
     st.header("Behaviour")
     st.caption("Question answered here: how do customers come back, how regular are they, and who is changing?")
     
@@ -1782,7 +1782,140 @@ def tab_behaviour(R: dict[str, Any]) -> None:
                 show_df(pretty(t))
 
 
-def tab_products(R: dict[str, Any]) -> None:
+def tab_rfm(R: dict[str, Any], raw_df: pd.DataFrame | None = None, period_params: dict | None = None) -> None:
+    """RFM Analysis tab with customer segmentation, value concentration, and action recommendations."""
+    st.header("6 RFM Analysis")
+    st.caption("Question answered here: which customers are champions, at risk, or need attention? How concentrated is revenue?")
+    
+    cf = table(R, "customer_features")
+    if cf.empty:
+        st.info("No customer features available.")
+        return
+    
+    # Compute RFM from raw data if available
+    if raw_df is not None and period_params:
+        analysis_date = period_params["current_end"]
+        with st.spinner("Computing RFM segmentation..."):
+            rfm = compute_rfm(raw_df, analysis_date)
+    else:
+        # Use existing customer_features if it has RFM columns
+        if "rfm_segment" in cf.columns:
+            st.info("Using pre-computed RFM from analysis pipeline.")
+            # Create a simplified RFM view
+            rfm = cf.copy()
+            if "rfm_segment" in cf.columns:
+                rfm["segment"] = cf["rfm_segment"]
+            else:
+                rfm["segment"] = "Unknown"
+        else:
+            st.warning("RFM requires raw transaction data. Run analysis with raw data available.")
+            return
+    
+    # === RFM Segments Visualization ===
+    st.subheader("RFM Segments")
+    fig, axes = plot_rfm_segments(rfm)
+    chart_card(fig, f"Identified {rfm['segment'].nunique()} RFM segments. Champions represent {rfm[rfm['segment']=='Champions']['monetary'].sum()/rfm['monetary'].sum()*100:.0f}% of revenue." if 'monetary' in rfm.columns else "RFM segmentation complete.")
+    
+    # Segment summary table
+    st.markdown("---")
+    st.subheader("Segment Summary")
+    seg_summary = rfm.groupby("segment").agg(
+        customers=("customer_id", "count"),
+        revenue=("monetary", "sum") if "monetary" in rfm.columns else ("customer_id", "count"),
+        avg_recency=("recency_days", "mean") if "recency_days" in rfm.columns else ("customer_id", "count"),
+        avg_frequency=("frequency", "mean") if "frequency" in rfm.columns else ("customer_id", "count"),
+        avg_monetary=("monetary", "mean") if "monetary" in rfm.columns else ("customer_id", "count"),
+    ).sort_values("revenue", ascending=False).reset_index()
+    
+    display_cols = ["segment", "customers"]
+    if "revenue" in seg_summary.columns:
+        display_cols.append("revenue")
+    if "avg_recency" in seg_summary.columns:
+        display_cols.extend(["avg_recency", "avg_frequency", "avg_monetary"])
+    
+    show_df(pretty(seg_summary[display_cols]))
+    
+    # === Customer Value Concentration (Pareto & Lorenz) ===
+    if "monetary" in rfm.columns:
+        st.markdown("---")
+        st.subheader("Customer Value Concentration")
+        
+        col1, col2 = st.columns(2)
+        with col1:
+            st.markdown("**Pareto: Top Customers by Lifetime Revenue**")
+            pareto_fig = _plot_customer_pareto(rfm)
+            if pareto_fig:
+                chart_card(pareto_fig[0], "Shows how much revenue is concentrated in top customers. 80% threshold indicates Pareto principle.")
+        
+        with col2:
+            st.markdown("**Lorenz Curve: Revenue Inequality**")
+            lorenz_fig = _plot_customer_lorenz(rfm)
+            if lorenz_fig:
+                chart_card(lorenz_fig[0], "Area between curve and diagonal = revenue concentration. Gini coefficient quantifies inequality.")
+        
+        # Value tiers
+        st.markdown("---")
+        st.markdown("**Value Tier Breakdown**")
+        tiers_fig = _plot_customer_value_tiers(rfm)
+        if tiers_fig:
+            chart_card(tiers_fig[0], "Compares customer count share vs revenue share by value tier. Top 20% typically drive 60-80% of revenue.")
+        
+        # Concentration table
+        st.markdown("**Concentration Summary**")
+        n = len(rfm)
+        rfm_sorted = rfm.sort_values("monetary", ascending=False).reset_index(drop=True)
+        rfm_sorted["cum_revenue_pct"] = rfm_sorted["monetary"].cumsum() / rfm_sorted["monetary"].sum() * 100
+        rfm_sorted["cum_customer_pct"] = np.arange(1, n+1) / n * 100
+        
+        tiers = [
+            ("Top 1%", 0, 1),
+            ("Top 5%", 1, 5),
+            ("Top 10%", 5, 10),
+            ("Top 20%", 10, 20),
+            ("Middle 50%", 20, 70),
+            ("Bottom 30%", 70, 100),
+        ]
+        
+        tier_data = []
+        for label, pct_start, pct_end in tiers:
+            start_idx = int(n * pct_start / 100)
+            end_idx = int(n * pct_end / 100)
+            tier_customers = rfm_sorted.iloc[start_idx:end_idx]
+            if len(tier_customers) == 0:
+                continue
+            tier_data.append({
+                "Tier": label,
+                "Customers": len(tier_customers),
+                "Customer %": f"{len(tier_customers) / n * 100:.1f}%",
+                "Revenue": fmt_currency(tier_customers["monetary"].sum()),
+                "Revenue %": f"{tier_customers['monetary'].sum() / rfm['monetary'].sum() * 100:.1f}%",
+                "Avg Revenue/Cust": fmt_currency(tier_customers["monetary"].mean()),
+            })
+        
+        tier_df = pd.DataFrame(tier_data)
+        show_df(pretty(tier_df))
+    
+    # Action recommendations
+    st.markdown("---")
+    st.subheader("Recommended Actions by Segment")
+    action_map = {
+        "Champions": "🟢 **Protect & Grow** - VIP treatment, early access, loyalty rewards",
+        "Loyal Customers": "🔵 **Cross-sell** - Bundle complementary categories, increase basket size",
+        "Potential Loyalists": "🟡 **Nurture** - Targeted offers to increase frequency",
+        "New Customers": "🟠 **Onboard** - Welcome series, second purchase incentives",
+        "At Risk High Value": "🔴 **Win-back** - Personal outreach, special offers",
+        "At Risk": "🔴 **Reactivate** - Win-back campaigns, feedback surveys",
+        "Hibernating": "⚪ **Low-cost reactivation** - Email reminders, small discounts",
+        "Needs Attention": "⚪ **Diagnose** - Analyze behavior patterns, test interventions",
+    }
+    
+    for seg, action in action_map.items():
+        count = len(rfm[rfm["segment"] == seg]) if seg in rfm["segment"].values else 0
+        if count > 0:
+            st.markdown(f"**{seg}** ({count:,} customers): {action}")
+
+
+def tab_products(R: dict[str, Any], raw_df: pd.DataFrame | None = None, period_params: dict | None = None) -> None:
     st.header("Products and baskets")
     st.caption("Question answered here: what sells, what is returned, and what is bought together or next?")
     
@@ -1832,7 +1965,7 @@ def tab_products(R: dict[str, Any]) -> None:
                 show_df(pretty(t.head(500)))
 
 
-def tab_explorer(R: dict[str, Any]) -> None:
+def tab_explorer(R: dict[str, Any], raw_df: pd.DataFrame | None = None, period_params: dict | None = None) -> None:
     import matplotlib.pyplot as plt
     st.header("Customer explorer")
     st.caption("Filter customers, export a target list, or look up a single customer. Build your own view.")
@@ -1958,7 +2091,7 @@ def tab_explorer(R: dict[str, Any]) -> None:
             show_df(hit.T.reset_index().rename(columns={"index": "field", hit.index[0]: "value"}).astype(str))
 
 
-def tab_data(R: dict[str, Any]) -> None:
+def tab_data(R: dict[str, Any], raw_df: pd.DataFrame | None = None, period_params: dict | None = None) -> None:
     st.header("Data and downloads")
     st.caption("Question answered here: what is wrong with the data, and where are the files?")
     
@@ -2686,7 +2819,649 @@ def _plot_top_product_trends(raw_df: pd.DataFrame, period_params: dict, prod_sum
         return None
 
 
-def tab_rfm(R: dict[str, Any], raw_df: pd.DataFrame | None = None, period_params: dict | None = None) -> None:
+# ============================================================
+# Phase 3: Advanced Insights - Helper Functions
+# ============================================================
+
+def _compute_basket_analysis(raw_df: pd.DataFrame, period_params: dict, min_support: float = 0.01) -> dict:
+    """Compute product pair associations: support, confidence, lift."""
+    try:
+        current_start = period_params["current_start"]
+        current_end = period_params["current_end"]
+        
+        curr_df = raw_df[
+            (raw_df["transaction_day"] >= current_start) & 
+            (raw_df["transaction_day"] <= current_end)
+        ].copy()
+        
+        if curr_df.empty:
+            return {}
+        
+        curr_df["revenue"] = curr_df["quantity"] * curr_df["price"]
+        total_orders = curr_df["transaction_id"].nunique()
+        
+        # Get product list per order
+        order_products = curr_df.groupby("transaction_id")["product_id"].apply(list).reset_index()
+        order_products.columns = ["transaction_id", "products"]
+        
+        # Single product metrics
+        prod_metrics = curr_df.groupby("product_id").agg(
+            orders=("transaction_id", "nunique"),
+            revenue=("revenue", "sum"),
+            units=("quantity", "sum"),
+        ).reset_index()
+        prod_metrics["support"] = prod_metrics["orders"] / total_orders
+        
+        # Filter products by min support
+        freq_products = prod_metrics[prod_metrics["support"] >= min_support]["product_id"].tolist()
+        
+        if len(freq_products) < 2:
+            return {"single": prod_metrics, "pairs": pd.DataFrame()}
+        
+        # Generate pairs within each basket
+        from itertools import combinations
+        pairs = []
+        for _, row in order_products.iterrows():
+            products = [p for p in row["products"] if p in freq_products]
+            if len(products) >= 2:
+                for a, b in combinations(sorted(products), 2):
+                    pairs.append((a, b))
+        
+        if not pairs:
+            return {"single": prod_metrics, "pairs": pd.DataFrame()}
+        
+        pair_df = pd.DataFrame(pairs, columns=["product_a", "product_b"])
+        pair_counts = pair_df.groupby(["product_a", "product_b"]).size().reset_index(name="co_occurrence")
+        pair_counts["support"] = pair_counts["co_occurrence"] / total_orders
+        
+        # Filter by min support
+        pair_counts = pair_counts[pair_counts["support"] >= min_support].copy()
+        
+        if pair_counts.empty:
+            return {"single": prod_metrics, "pairs": pd.DataFrame()}
+        
+        # Merge single product metrics for confidence/lift
+        pair_counts = pair_counts.merge(
+            prod_metrics[["product_id", "orders"]].rename(columns={"product_id": "product_a", "orders": "orders_a"}),
+            on="product_a", how="left"
+        )
+        pair_counts = pair_counts.merge(
+            prod_metrics[["product_id", "orders"]].rename(columns={"product_id": "product_b", "orders": "orders_b"}),
+            on="product_b", how="left"
+        )
+        
+        pair_counts["confidence_a_to_b"] = pair_counts["co_occurrence"] / pair_counts["orders_a"]
+        pair_counts["confidence_b_to_a"] = pair_counts["co_occurrence"] / pair_counts["orders_b"]
+        
+        # Lift = confidence / expected probability
+        pair_counts["lift"] = pair_counts["confidence_a_to_b"] / (pair_counts["orders_b"] / total_orders)
+        
+        # Add revenue
+        pair_counts = pair_counts.merge(
+            prod_metrics[["product_id", "revenue"]].rename(columns={"product_id": "product_a", "revenue": "revenue_a"}),
+            on="product_a", how="left"
+        )
+        pair_counts = pair_counts.merge(
+            prod_metrics[["product_id", "revenue"]].rename(columns={"product_id": "product_b", "revenue": "revenue_b"}),
+            on="product_b", how="left"
+        )
+        pair_counts["combined_revenue"] = pair_counts["revenue_a"] + pair_counts["revenue_b"]
+        
+        # Sort by lift
+        pair_counts = pair_counts.sort_values("lift", ascending=False)
+        
+        return {"single": prod_metrics, "pairs": pair_counts}
+    except Exception:
+        return {}
+
+
+def _plot_basket_network(pairs_df: pd.DataFrame, top_n: int = 30) -> tuple | None:
+    """Network graph of top product associations."""
+    try:
+        import networkx as nx
+        if pairs_df.empty or len(pairs_df) < 2:
+            return None
+        
+        # Take top N by lift
+        top_pairs = pairs_df.head(top_n).copy()
+        
+        G = nx.Graph()
+        for _, row in top_pairs.iterrows():
+            G.add_edge(row["product_a"], row["product_b"], 
+                      weight=row["lift"], 
+                      support=row["support"],
+                      confidence=row["confidence_a_to_b"])
+        
+        if len(G.nodes()) == 0:
+            return None
+        
+        import matplotlib.pyplot as plt
+        fig, ax = plt.subplots(figsize=(12, 10))
+        
+        # Spring layout
+        pos = nx.spring_layout(G, k=3, iterations=50, seed=42)
+        
+        # Node sizes by degree
+        node_sizes = [G.degree(n) * 300 + 200 for n in G.nodes()]
+        
+        # Edge widths by lift
+        edges = G.edges()
+        weights = [G[u][v]["weight"] for u, v in edges]
+        max_w = max(weights) if weights else 1
+        min_w = min(weights) if weights else 1
+        
+        # Draw edges
+        for (u, v), w in zip(edges, weights):
+            width = 1 + 4 * (w - min_w) / max(1e-6, max_w - min_w)
+            nx.draw_networkx_edges(G, pos, edgelist=[(u, v)], 
+                                 width=width, alpha=0.5, edge_color="#2b6cb0", ax=ax)
+        
+        # Draw nodes
+        nx.draw_networkx_nodes(G, pos, node_size=node_sizes, 
+                              node_color="#2b6cb0", alpha=0.7, ax=ax)
+        
+        # Labels (shortened)
+        labels = {n: str(n)[:15] for n in G.nodes()}
+        nx.draw_networkx_labels(G, pos, labels, font_size=8, font_weight="bold", ax=ax)
+        
+        ax.set_title(f"Product Association Network (Top {len(G.nodes())} Products, {len(G.edges())} Pairs)", 
+                    fontsize=13, fontweight='bold', pad=15)
+        ax.set_axis_off()
+        
+        plt.tight_layout()
+        return fig, ax
+    except Exception:
+        return None
+
+
+def _plot_basket_heatmap(pairs_df: pd.DataFrame, top_n: int = 20) -> tuple | None:
+    """Heatmap of product pair lift."""
+    try:
+        if pairs_df.empty:
+            return None
+        
+        # Get top products by appearance in pairs
+        all_prods = pd.concat([pairs_df["product_a"], pairs_df["product_b"]]).unique()
+        if len(all_prods) < 2:
+            return None
+        
+        # Limit to top N
+        if len(all_prods) > top_n:
+            # Score products by sum of lift in their pairs
+            prod_scores = pairs_df.groupby("product_a")["lift"].sum().add(
+                pairs_df.groupby("product_b")["lift"].sum(), fill_value=0
+            ).sort_values(ascending=False)
+            top_prods = prod_scores.head(top_n).index.tolist()
+            pairs_df = pairs_df[
+                pairs_df["product_a"].isin(top_prods) & 
+                pairs_df["product_b"].isin(top_prods)
+            ].copy()
+        
+        # Create matrix
+        products = sorted(pairs_df["product_a"].unique())
+        if len(products) < 2:
+            return None
+        
+        matrix = pd.DataFrame(1.0, index=products, columns=products)
+        
+        for _, row in pairs_df.iterrows():
+            matrix.loc[row["product_a"], row["product_b"]] = row["lift"]
+            matrix.loc[row["product_b"], row["product_a"]] = row["lift"]
+        
+        import matplotlib.pyplot as plt
+        from matplotlib.colors import TwoSlopeNorm
+        
+        fig, ax = plt.subplots(figsize=(10, 8))
+        
+        vals = matrix.to_numpy(float)
+        hi = max(float(np.nanmax(vals)), 1.05)
+        lo = min(float(np.nanmin(vals)), 0.95)
+        
+        cmap = plt.get_cmap("RdBu_r").copy()
+        cmap.set_bad("#f7fafc")
+        
+        norm = TwoSlopeNorm(vcenter=1.0, vmin=min(lo, 0.5), vmax=hi)
+        im = ax.imshow(np.ma.masked_invalid(vals), cmap=cmap, norm=norm, aspect="auto")
+        
+        ax.set_xticks(range(len(products)))
+        ax.set_xticklabels([str(p)[:15] for p in products], rotation=60, ha="right", fontsize=8)
+        ax.set_yticks(range(len(products)))
+        ax.set_yticklabels([str(p)[:15] for p in products], fontsize=8)
+        
+        ax.set_title(f"Product Pair Lift Matrix (Lift > 1 = Positive Association)", 
+                    fontsize=13, fontweight='bold', pad=15)
+        
+        cbar = fig.colorbar(im, ax=ax, label="Lift")
+        
+        plt.tight_layout()
+        return fig, ax
+    except Exception:
+        return None
+
+
+def _plot_basket_top_pairs(pairs_df: pd.DataFrame, top_n: int = 15) -> tuple | None:
+    """Horizontal bar chart of top pairs by lift."""
+    try:
+        if pairs_df.empty:
+            return None
+        
+        top = pairs_df.head(top_n).iloc[::-1].copy()
+        
+        import matplotlib.pyplot as plt
+        fig, ax = plt.subplots(figsize=(10, max(4, 0.35 * len(top) + 1)))
+        
+        labels = [f"{row['product_a'][:12]} + {row['product_b'][:12]}" for _, row in top.iterrows()]
+        y_pos = np.arange(len(top))
+        
+        bars = ax.barh(y_pos, top["lift"], color="#2b6cb0", edgecolor='white', height=0.6)
+        
+        ax.set_yticks(y_pos)
+        ax.set_yticklabels(labels, fontsize=9)
+        ax.set_xlabel("Lift", fontsize=10)
+        ax.set_title(f"Top {len(top)} Product Pairs by Lift", fontsize=13, fontweight='bold', pad=15)
+        ax.axvline(x=1, color='gray', linestyle='--', alpha=0.5, linewidth=1)
+        ax.spines['top'].set_visible(False)
+        ax.spines['right'].set_visible(False)
+        ax.grid(axis='x', alpha=0.3)
+        
+        # Add annotations
+        for bar, (_, row) in zip(bars, top.iterrows()):
+            ax.text(bar.get_width() + 0.02, bar.get_y() + bar.get_height()/2,
+                   f"Lift: {row['lift']:.2f} | Supp: {row['support']*100:.1f}% | Conf: {row['confidence_a_to_b']*100:.1f}%",
+                   va='center', fontsize=8)
+        
+        plt.tight_layout()
+        return fig, ax
+    except Exception:
+        return None
+
+
+def _compute_anomalies(raw_df: pd.DataFrame, period_params: dict, window_days: int = 28, k: float = 2.0) -> dict:
+    """Detect anomalies in daily KPIs using rolling mean ± k*std."""
+    try:
+        current_start = period_params["current_start"]
+        current_end = period_params["current_end"]
+        
+        # Use wider window for rolling stats
+        full_start = current_start - pd.Timedelta(days=window_days * 2)
+        full_end = current_end
+        
+        df = raw_df[
+            (raw_df["transaction_day"] >= full_start) & 
+            (raw_df["transaction_day"] <= full_end)
+        ].copy()
+        
+        if df.empty:
+            return {}
+        
+        df["revenue"] = df["quantity"] * df["price"]
+        
+        # Daily aggregation
+        daily = df.groupby("transaction_day").agg(
+            revenue=("revenue", "sum"),
+            orders=("transaction_id", "nunique"),
+            customers=("customer_id", "nunique"),
+            units=("quantity", "sum"),
+        ).reset_index()
+        
+        daily["aov"] = daily["revenue"] / daily["orders"].replace(0, np.nan)
+        daily["units_per_order"] = daily["units"] / daily["orders"].replace(0, np.nan)
+        daily["revenue_per_customer"] = daily["revenue"] / daily["customers"].replace(0, np.nan)
+        
+        # Rolling stats
+        metrics = ["revenue", "orders", "customers", "aov", "units_per_order", "revenue_per_customer"]
+        anomalies = {}
+        
+        for metric in metrics:
+            if metric not in daily.columns or daily[metric].isna().all():
+                continue
+            
+            rolling_mean = daily[metric].rolling(window=window_days, min_periods=7).mean()
+            rolling_std = daily[metric].rolling(window=window_days, min_periods=7).std()
+            
+            upper = rolling_mean + k * rolling_std
+            lower = rolling_mean - k * rolling_std
+            
+            # Flag anomalies in current period
+            curr_mask = (daily["transaction_day"] >= current_start) & (daily["transaction_day"] <= current_end)
+            curr_data = daily[curr_mask].copy()
+            
+            metric_anomalies = []
+            for _, row in curr_data.iterrows():
+                idx = row.name
+                val = row[metric]
+                exp = rolling_mean.loc[idx]
+                up = upper.loc[idx]
+                lo = lower.loc[idx]
+                
+                if pd.notna(val) and pd.notna(exp) and (val > up or val < lo):
+                    pct_dev = (val - exp) / exp * 100 if exp != 0 else 0
+                    metric_anomalies.append({
+                        "date": row["transaction_day"],
+                        "value": val,
+                        "expected": exp,
+                        "upper": up,
+                        "lower": lo,
+                        "pct_deviation": pct_dev,
+                        "direction": "high" if val > up else "low"
+                    })
+            
+            if metric_anomalies:
+                anomalies[metric] = metric_anomalies
+        
+        return {"daily": daily, "anomalies": anomalies}
+    except Exception:
+        return {}
+
+
+def _plot_anomaly_timeseries(anomaly_data: dict, metric: str) -> tuple | None:
+    """Time series with anomaly markers for a specific metric."""
+    try:
+        daily = anomaly_data.get("daily", pd.DataFrame())
+        anomalies = anomaly_data.get("anomalies", {}).get(metric, [])
+        
+        if daily.empty or metric not in daily.columns:
+            return None
+        
+        import matplotlib.pyplot as plt
+        fig, ax = plt.subplots(figsize=(12, 4))
+        
+        # Plot all data
+        ax.plot(daily["transaction_day"], daily[metric], color="#1a202c", linewidth=1.5, label="Actual", alpha=0.7)
+        
+        # Highlight current period
+        curr_mask = (daily["transaction_day"] >= anomaly_data.get("current_start", daily["transaction_day"].min())) & \
+                    (daily["transaction_day"] <= anomaly_data.get("current_end", daily["transaction_day"].max()))
+        
+        # Mark anomalies
+        if anomalies:
+            anom_dates = [a["date"] for a in anomalies]
+            anom_vals = [a["value"] for a in anomalies]
+            ax.scatter(anom_dates, anom_vals, color="#e53e3e", s=80, marker='X', 
+                      zorder=10, label='Anomaly', edgecolors='white', linewidth=1)
+            
+            for a in anomalies:
+                ax.annotate(f"{a['pct_deviation']:+.0f}%", 
+                           xy=(a["date"], a["value"]),
+                           xytext=(0, 15), textcoords='offset points',
+                           ha='center', fontsize=8, color='#e53e3e', fontweight='bold')
+        
+        ax.set_title(f"{metric.replace('_', ' ').title()} - Anomaly Detection", fontsize=13, fontweight='bold', pad=15)
+        ax.set_ylabel(metric.replace('_', ' ').title(), fontsize=10)
+        ax.legend(loc='upper left', fontsize=9)
+        ax.spines['top'].set_visible(False)
+        ax.spines['right'].set_visible(False)
+        ax.grid(axis='y', alpha=0.3)
+        
+        fig.autofmt_xdate(rotation=30)
+        plt.tight_layout()
+        return fig, ax
+    except Exception:
+        return None
+
+
+def _plot_anomaly_summary(anomaly_data: dict) -> tuple | None:
+    """Summary bar chart of all anomalies by metric."""
+    try:
+        anomalies = anomaly_data.get("anomalies", {})
+        if not anomalies:
+            return None
+        
+        # Count anomalies per metric
+        metric_counts = {m: len(v) for m, v in anomalies.items() if v}
+        if not metric_counts:
+            return None
+        
+        # Get max deviation per metric
+        metric_max_dev = {}
+        for m, v in anomalies.items():
+            if v:
+                metric_max_dev[m] = max(abs(a["pct_deviation"]) for a in v)
+        
+        metrics = list(metric_counts.keys())
+        counts = [metric_counts[m] for m in metrics]
+        max_devs = [metric_max_dev.get(m, 0) for m in metrics]
+        
+        import matplotlib.pyplot as plt
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4))
+        
+        # Count
+        bars1 = ax1.barh(metrics, counts, color="#e53e3e", edgecolor='white')
+        ax1.set_xlabel("Anomaly Count", fontsize=10)
+        ax1.set_title("Anomalies by Metric (Current Period)", fontsize=12, fontweight='bold')
+        ax1.spines['top'].set_visible(False)
+        ax1.spines['right'].set_visible(False)
+        ax1.grid(axis='x', alpha=0.3)
+        
+        for bar, c in zip(bars1, counts):
+            ax1.text(bar.get_width() + 0.1, bar.get_y() + bar.get_height()/2, str(c), va='center', fontsize=9)
+        
+        # Max deviation
+        colors = ["#e53e3e" if d > 0 else "#2f855a" for d in max_devs]
+        bars2 = ax2.barh(metrics, max_devs, color=colors, edgecolor='white')
+        ax2.set_xlabel("Max % Deviation from Expected", fontsize=10)
+        ax2.set_title("Largest Deviation by Metric", fontsize=12, fontweight='bold')
+        ax2.axvline(x=0, color='gray', linewidth=0.5)
+        ax2.spines['top'].set_visible(False)
+        ax2.spines['right'].set_visible(False)
+        ax2.grid(axis='x', alpha=0.3)
+        
+        for bar, d in zip(bars2, max_devs):
+            ax2.text(bar.get_width() + 0.5, bar.get_y() + bar.get_height()/2, f"{d:.0f}%", va='center', fontsize=9)
+        
+        plt.tight_layout()
+        return fig, (ax1, ax2)
+    except Exception:
+        return None
+
+
+def _generate_action_matrix(rfm: pd.DataFrame, basket_data: dict, anomaly_data: dict, 
+                            category_data: dict, retention_metrics: dict) -> list:
+    """Generate prioritized action items from all analyses."""
+    actions = []
+    
+    try:
+        # 1. High-value churned customers
+        if retention_metrics and retention_metrics.get("churned_valuable_count", 0) > 0:
+            actions.append({
+                "priority": 1,
+                "category": "Retention",
+                "title": f"Win-back {retention_metrics['churned_valuable_count']} high-value churned customers",
+                "impact": fmt_currency(retention_metrics['churned_valuable_revenue']),
+                "evidence": f"Top 20% by historical revenue not active in current period",
+                "action": "Personal outreach with tailored offers; test against holdout group",
+                "metric_to_track": "Reactivation rate, revenue recovered"
+            })
+        
+        # 2. At-risk high-value RFM segment
+        if "segment" in rfm.columns and "monetary" in rfm.columns:
+            at_risk = rfm[rfm["segment"].isin(["At Risk High Value", "At Risk"])]
+            if len(at_risk) > 0:
+                actions.append({
+                    "priority": 2,
+                    "category": "Retention",
+                    "title": f"Reactivate {len(at_risk)} at-risk customers",
+                    "impact": fmt_currency(at_risk["monetary"].sum()),
+                    "evidence": "RFM segments with high historical value but declining recency",
+                    "action": "Targeted win-back campaigns; personalized product recommendations",
+                    "metric_to_track": "Reactivation rate, revenue per reactivated customer"
+                })
+        
+        # 3. New customer onboarding
+        if retention_metrics and retention_metrics.get("new_customer_share", 0) > 0:
+            new_cust_rev = retention_metrics.get("new_customer_share", 0) * 100
+            if new_cust_rev > 20:  # High new customer share
+                actions.append({
+                    "priority": 3,
+                    "category": "Acquisition",
+                    "title": f"Optimize onboarding for {new_cust_rev:.0f}% new customers",
+                    "impact": "High (lifetime value)",
+                    "evidence": f"New customers represent {new_cust_rev:.0f}% of active base",
+                    "action": "Welcome series, second-purchase incentive, category discovery",
+                    "metric_to_track": "Second purchase rate within 30/60/90 days"
+                })
+        
+        # 4. Cross-sell opportunities from basket analysis
+        if basket_data and "pairs" in basket_data and not basket_data["pairs"].empty:
+            pairs = basket_data["pairs"]
+            high_lift = pairs[pairs["lift"] > 2.0].head(5)
+            if len(high_lift) > 0:
+                actions.append({
+                    "priority": 4,
+                    "category": "Cross-sell",
+                    "title": f"Test {len(high_lift)} high-lift product bundles",
+                    "impact": "Medium-High (AOV uplift)",
+                    "evidence": f"Pairs with lift > 2.0 indicate strong association (e.g., {high_lift.iloc[0]['product_a']} + {high_lift.iloc[0]['product_b']}: lift {high_lift.iloc[0]['lift']:.1f})",
+                    "action": "A/B test bundle offers or placement; measure attachment rate lift",
+                    "metric_to_track": "Bundle attachment rate, AOV, units per order"
+                })
+        
+        # 5. Category opportunities
+        if category_data:
+            # Categories underperforming total growth
+            pass  # Could add based on category growth vs share
+        
+        # 6. Anomaly-driven investigations
+        if anomaly_data and anomaly_data.get("anomalies"):
+            total_anoms = sum(len(v) for v in anomaly_data["anomalies"].values())
+            if total_anoms > 0:
+                actions.append({
+                    "priority": 5,
+                    "category": "Diagnostics",
+                    "title": f"Investigate {total_anoms} anomalous KPI signals",
+                    "impact": "Variable",
+                    "evidence": f"Anomalies detected in: {', '.join(anomaly_data['anomalies'].keys())}",
+                    "action": "Drill into affected segments/categories/dates; identify root cause",
+                    "metric_to_track": "Return to expected range"
+                })
+        
+        # 6. Champions - protect and grow
+        if "segment" in rfm.columns and "monetary" in rfm.columns:
+            champions = rfm[rfm["segment"] == "Champions"]
+            if len(champions) > 0:
+                actions.append({
+                    "priority": 6,
+                    "category": "Growth",
+                    "title": f"Deepen {len(champions)} Champions relationships",
+                    "impact": fmt_currency(champions["monetary"].sum()),
+                    "evidence": "Champions = high recency, frequency, monetary",
+                    "action": "VIP program, early access, referral incentives, cross-category expansion",
+                    "metric_to_track": "Revenue per champion, category breadth, referral rate"
+                })
+        
+        # Sort by priority
+        actions.sort(key=lambda x: x["priority"])
+        return actions
+    except Exception:
+        return []
+
+
+def _render_action_matrix(actions: list) -> None:
+    """Render action matrix as prioritized cards."""
+    if not actions:
+        st.info("No actions generated. Run analyses to populate.")
+        return
+    
+    st.subheader("Prioritized Action Matrix")
+    st.caption("Actions ranked by estimated revenue impact and evidence strength")
+    
+    for action in actions:
+        priority_colors = {1: "🔴", 2: "🟠", 3: "🟡", 4: "🔵", 5: "🟣", 6: "🟢"}
+        icon = priority_colors.get(action["priority"], "⚪")
+        
+        with st.expander(f"{icon} **Priority {action['priority']}** | {action['category']} | {action['title']}", expanded=action["priority"] <= 2):
+            col1, col2 = st.columns([2, 1])
+            with col1:
+                st.markdown(f"**Evidence:** {action['evidence']}")
+                st.markdown(f"**Recommended Action:** {action['action']}")
+                st.markdown(f"**Metric to Track:** {action['metric_to_track']}")
+            with col2:
+                st.metric("Est. Impact", action["impact"])
+                st.markdown(f"*Priority: {action['priority']}*")
+
+
+def _plot_drilldown_path(raw_df: pd.DataFrame, period_params: dict, 
+                         dimension: str, metric: str, top_n: int = 10) -> tuple | None:
+    """Drill-down bar chart: show metric by dimension for current vs prior."""
+    try:
+        current_start = period_params["current_start"]
+        current_end = period_params["current_end"]
+        
+        if period_params["compare_mode"] == "prior":
+            period_len = (current_end - current_start).days + 1
+            prior_end = current_start - pd.Timedelta(days=1)
+            prior_start = prior_end - pd.Timedelta(days=period_len - 1)
+        else:
+            prior_start = current_start - pd.DateOffset(years=1)
+            prior_end = current_end - pd.DateOffset(years=1)
+        
+        curr_df = raw_df[
+            (raw_df["transaction_day"] >= current_start) & 
+            (raw_df["transaction_day"] <= current_end)
+        ].copy()
+        prior_df = raw_df[
+            (raw_df["transaction_day"] >= prior_start) & 
+            (raw_df["transaction_day"] <= prior_end)
+        ].copy()
+        
+        if curr_df.empty or prior_df.empty:
+            return None
+        
+        curr_df["revenue"] = curr_df["quantity"] * curr_df["price"]
+        prior_df["revenue"] = prior_df["quantity"] * prior_df["price"]
+        
+        if metric == "revenue":
+            curr_agg = curr_df.groupby(dimension)["revenue"].sum().reset_index()
+            prior_agg = prior_df.groupby(dimension)["revenue"].sum().reset_index()
+        elif metric == "orders":
+            curr_agg = curr_df.groupby(dimension)["transaction_id"].nunique().reset_index()
+            curr_agg.columns = [dimension, "revenue"]
+            prior_agg = prior_df.groupby(dimension)["transaction_id"].nunique().reset_index()
+            prior_agg.columns = [dimension, "revenue"]
+        elif metric == "customers":
+            curr_agg = curr_df.groupby(dimension)["customer_id"].nunique().reset_index()
+            curr_agg.columns = [dimension, "revenue"]
+            prior_agg = prior_df.groupby(dimension)["customer_id"].nunique().reset_index()
+            prior_agg.columns = [dimension, "revenue"]
+        else:
+            return None
+        
+        merged = curr_agg.merge(prior_agg, on=dimension, how="outer", suffixes=("_curr", "_prior")).fillna(0)
+        merged["change"] = merged["revenue_curr"] - merged["revenue_prior"]
+        merged["pct_change"] = (merged["change"] / merged["revenue_prior"].replace(0, np.nan) * 100).round(1)
+        
+        # Top N by absolute change
+        merged = merged.nlargest(top_n, "change", keep="all") if merged["change"].sum() > 0 else merged.nsmallest(top_n, "change", keep="all")
+        
+        import matplotlib.pyplot as plt
+        fig, ax = plt.subplots(figsize=(10, max(4, 0.35 * len(merged) + 1)))
+        
+        labels = [f"{str(row[dimension])[:25]} ({row['pct_change']:+.1f}%)" for _, row in merged.iterrows()]
+        values = merged["change"].values
+        
+        colors = ["#2f855a" if v >= 0 else "#e53e3e" for v in values]
+        bars = ax.barh(range(len(labels)), values, color=colors, edgecolor='white', height=0.6)
+        
+        ax.set_yticks(range(len(labels)))
+        ax.set_yticklabels(labels, fontsize=9)
+        ax.set_xlabel(f"{metric.title()} Change", fontsize=10)
+        ax.set_title(f"{dimension.title()} Drill-Down: {metric.title()} Change (Current vs Prior)", fontsize=13, fontweight='bold', pad=15)
+        ax.axvline(x=0, color='gray', linewidth=0.5)
+        ax.spines['top'].set_visible(False)
+        ax.spines['right'].set_visible(False)
+        ax.grid(axis='x', alpha=0.3)
+        ax.xaxis.set_major_formatter(plt.FuncFormatter(lambda x, _: fmt_currency(x) if metric == "revenue" else fmt_number(x)))
+        
+        for bar, val in zip(bars, values):
+            ax.text(val + (max(values) - min(values)) * 0.01 if val >= 0 else val - (max(values) - min(values)) * 0.01,
+                   bar.get_y() + bar.get_height()/2,
+                   fmt_currency(val) if metric == "revenue" else fmt_number(val), 
+                   va='center', ha='left' if val >= 0 else 'right', fontsize=9, fontweight='bold')
+        
+        plt.tight_layout()
+        return fig, ax
+    except Exception:
+        return None
     """RFM Analysis tab with customer segmentation, value concentration, and action recommendations."""
     st.header("6 RFM Analysis")
     st.caption("Question answered here: which customers are champions, at risk, or need attention? How concentrated is revenue?")
