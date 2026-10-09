@@ -558,9 +558,8 @@ def tab_overview(R: dict[str, Any]) -> None:
     with col1:
         show_charts(R, ["10_revenue_trend"])
     with col2:
-        st.markdown("**Segment Revenue Mix Over Time**")
-        # This would need segment x month data - placeholder
-        st.info("Segment mix chart available after clustering")
+        st.markdown("**Segment Revenue Share**")
+        show_charts(R, ["04_segment_value"])
     
     meta = R["meta"]
     warnings = meta.get("warnings") or []
@@ -718,9 +717,8 @@ def tab_behaviour(R: dict[str, Any]) -> None:
     
     # Cohort Revenue per Customer (LTV)
     st.markdown("---")
-    section("Cohort Revenue: How much is each cohort worth?", "Cumulative revenue per customer by cohort age")
-    # This would need cohort_ltv table - placeholder
-    st.info("Cohort LTV chart requires cohort_ltv table from analysis")
+    section("Cohort Revenue & Retention", "Cohort retention heatmap + revenue quality")
+    show_charts(R, ["22_cohort_ltv"])
     
     # Time-to-second-purchase survival curves
     st.markdown("---")
@@ -731,12 +729,6 @@ def tab_behaviour(R: dict[str, Any]) -> None:
     st.markdown("---")
     section("Purchase Rhythm: How regular are customers?", "Inter-purchase interval distribution by segment")
     show_charts(R, ["16_cadence"])
-    
-    # Day of week x Hour heatmap
-    st.markdown("---")
-    section("Trading Pattern: When do customers buy?", "Day of week x Hour of day transaction density")
-    # This would need transaction timestamps - placeholder
-    st.info("Day-of-week x hour heatmap requires transaction timestamps")
     
     # Momentum chart
     st.markdown("---")
@@ -760,15 +752,9 @@ def tab_products(R: dict[str, Any]) -> None:
     
     st.markdown("---")
     
-    # Department Chord Diagram
-    section("Cross-Department Flows: What departments are bought together?", "Chord diagram showing co-purchase lift between departments")
-    # Placeholder - needs pyCirclize
-    st.info("Department chord diagram requires `pyCirclize` package. Install with: `pip install pycirclize`")
-    
     # Affinity Network
-    st.markdown("---")
     section("Affinity Network: Cross-sell structure", "Network graph of statistically significant basket rules (FDR-controlled)")
-    show_charts(R, ["12_basket_rules"])
+    show_charts(R, ["20_affinity_network"])
     
     aff = table(R, "basket_affinity")
     if len(aff) and "passes_all_filters" in aff.columns:
@@ -783,11 +769,10 @@ def tab_products(R: dict[str, Any]) -> None:
     section("Category Pareto: Assortment concentration", "Top categories by revenue with cumulative share line")
     show_charts(R, ["11_categories"])
     
-    # Discount share and return rate by category (lollipop)
+    # Margin Risk: Return rate by category
     st.markdown("---")
-    section("Margin Risk: Discount share vs Return rate by category", "Lollipop chart - position = discount share, color = return rate")
-    # Placeholder
-    st.info("Discount/return lollipop requires promo proxy features to be computed")
+    section("Margin Risk: Return rate by category", "Lollipop chart showing return rate for top categories")
+    show_charts(R, ["21_promo_return_lollipop"])
     
     # Next-trip transitions
     st.markdown("---")
@@ -797,8 +782,8 @@ def tab_products(R: dict[str, Any]) -> None:
         with st.expander("Next-trip transitions"):
             show_df(pretty(nxt))
     
-    # Revenue trend
-    show_charts(R, ["10_revenue_trend", "13_next_trip"])
+    # Basket rules lift matrix
+    show_charts(R, ["12_basket_rules", "13_next_trip"])
     
     for stem, title in (("category_summary", "Category summary"), ("department_summary", "Department summary"), ("product_summary", "Product summary")):
         t = table(R, stem)
@@ -808,6 +793,7 @@ def tab_products(R: dict[str, Any]) -> None:
 
 
 def tab_explorer(R: dict[str, Any]) -> None:
+    import matplotlib.pyplot as plt
     st.header("Customer explorer")
     st.caption("Filter customers, export a target list, or look up a single customer. Build your own view.")
     
@@ -830,7 +816,6 @@ def tab_explorer(R: dict[str, Any]) -> None:
         x_metric = c1.selectbox("X metric (numeric)", numeric_cols, index=numeric_cols.index("p_alive") if "p_alive" in numeric_cols else 0)
         color_dim = c2.selectbox("Color by", cat_cols, index=cat_cols.index("cluster_label") if "cluster_label" in cat_cols else 0)
         
-        import matplotlib.pyplot as plt
         fig, ax = plt.subplots(figsize=(10, 6))
         for lab in sorted(cf[color_dim].dropna().unique()):
             s = cf[cf[color_dim] == lab]
