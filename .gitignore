@@ -3,6 +3,7 @@ test_data*/
 test_output*/
 test_final/
 sample_data.csv
+sample_data.parquet
 
 # Python
 __pycache__/
