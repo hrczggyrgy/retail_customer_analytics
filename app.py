@@ -529,6 +529,18 @@ def plot_rfm_segments(rfm: pd.DataFrame) -> tuple:
     """Create RFM visualizations: segment bars + quadrant scatter."""
     import matplotlib.pyplot as plt
     
+    # Check required columns exist
+    required_cols = ["segment", "customer_id", "monetary", "recency_days", "frequency"]
+    missing = [c for c in required_cols if c not in rfm.columns]
+    if missing:
+        # Return empty figure with error message
+        fig, axes = plt.subplots(1, 2, figsize=(14, 5.5))
+        for ax in axes:
+            ax.text(0.5, 0.5, f"Missing columns for RFM plot: {missing}\nRequired: segment, customer_id, monetary, recency_days, frequency",
+                   ha='center', va='center', transform=ax.transAxes, fontsize=10, color='red')
+            ax.set_axis_off()
+        return fig, axes
+    
     fig, axes = plt.subplots(1, 2, figsize=(14, 5.5))
     
     # 1. Segment summary bars
@@ -1817,12 +1829,22 @@ def tab_rfm(R: dict[str, Any], raw_df: pd.DataFrame | None = None, period_params
         # Use existing customer_features if it has RFM columns
         if "rfm_segment" in cf.columns:
             st.info("Using pre-computed RFM from analysis pipeline.")
-            # Create a simplified RFM view
+            # Create a simplified RFM view with required columns for plotting
             rfm = cf.copy()
             if "rfm_segment" in cf.columns:
                 rfm["segment"] = cf["rfm_segment"]
             else:
                 rfm["segment"] = "Unknown"
+            # Map columns needed by plot_rfm_segments
+            if "monetary" not in rfm.columns and "net_spend" in rfm.columns:
+                rfm["monetary"] = rfm["net_spend"]
+            if "recency_days" not in rfm.columns and "recency_days" in cf.columns:
+                rfm["recency_days"] = cf["recency_days"]
+            if "frequency" not in rfm.columns and "n_trips" in cf.columns:
+                rfm["frequency"] = cf["n_trips"]
+            # Ensure customer_id exists
+            if "customer_id" not in rfm.columns and "customer_id" in cf.columns:
+                rfm["customer_id"] = cf["customer_id"]
         else:
             st.warning("RFM requires raw transaction data. Run analysis with raw data available.")
             return
