@@ -3540,34 +3540,53 @@ def _plot_anomaly_summary(anomaly_data: dict) -> tuple | None:
 
 def _generate_action_matrix(rfm: pd.DataFrame, basket_data: dict, anomaly_data: dict, 
                             category_data: dict, retention_metrics: dict) -> list:
-    """Generate prioritized action items from all analyses."""
+    """Generate prioritized action items from all analyses.
+    
+    Priority rules (explicit, not static):
+    1. High-value inactive: count > 0
+    2. At-risk high-value: monetary at risk > 0
+    3. New customer onboarding: new_customer_share > 20%
+    4. Cross-sell: high-lift pairs exist (lift > 2.0)
+    5. Anomalies: any anomalies detected
+    6. Champions: count > 0
+    """
     actions = []
     
     try:
         # 1. High-value inactive customers
         if retention_metrics and retention_metrics.get("inactive_valuable_count", 0) > 0:
+            inactive_ids = []  # Would need customer IDs from retention computation
             actions.append({
                 "priority": 1,
                 "category": "Retention",
                 "title": f"Win-back {retention_metrics['inactive_valuable_count']} high-value inactive customers",
                 "impact": fmt_currency(retention_metrics['inactive_valuable_revenue']),
-                "evidence": f"Top 20% by historical revenue not active in current period",
+                "impact_type": "historical_revenue_at_risk",
+                "evidence": f"Top 20% by historical revenue not active in current period (inactivity window: {retention_metrics.get('inactivity_window_days', 90)} days)",
                 "action": "Personal outreach with tailored offers; test against holdout group",
-                "metric_to_track": "Reactivation rate, revenue recovered"
+                "metric_to_track": "Reactivation rate, revenue recovered",
+                "affected_entities": inactive_ids,
+                "affected_count": retention_metrics['inactive_valuable_count'],
+                "priority_rule": "inactive_valuable_count > 0",
             })
         
         # 2. At-risk high-value RFM segment
         if "segment" in rfm.columns and "monetary" in rfm.columns:
             at_risk = rfm[rfm["segment"].isin(["At Risk High Value", "At Risk"])]
             if len(at_risk) > 0:
+                at_risk_ids = at_risk["customer_id"].tolist() if "customer_id" in at_risk.columns else []
                 actions.append({
                     "priority": 2,
                     "category": "Retention",
                     "title": f"Reactivate {len(at_risk)} at-risk customers",
                     "impact": fmt_currency(at_risk["monetary"].sum()),
-                    "evidence": "RFM segments with high historical value but declining recency",
+                    "impact_type": "historical_revenue_at_risk",
+                    "evidence": f"RFM segments 'At Risk High Value' and 'At Risk' with total historical revenue {fmt_currency(at_risk['monetary'].sum())}",
                     "action": "Targeted win-back campaigns; personalized product recommendations",
-                    "metric_to_track": "Reactivation rate, revenue per reactivated customer"
+                    "metric_to_track": "Reactivation rate, revenue per reactivated customer",
+                    "affected_entities": at_risk_ids,
+                    "affected_count": len(at_risk),
+                    "priority_rule": "at_risk_monetary_sum > 0",
                 })
         
         # 3. New customer onboarding
@@ -3579,9 +3598,13 @@ def _generate_action_matrix(rfm: pd.DataFrame, basket_data: dict, anomaly_data: 
                     "category": "Acquisition",
                     "title": f"Optimize onboarding for {new_cust_rev:.0f}% new customers",
                     "impact": "High (lifetime value)",
+                    "impact_type": "future_lifetime_value",
                     "evidence": f"New customers represent {new_cust_rev:.0f}% of active base",
                     "action": "Welcome series, second-purchase incentive, category discovery",
-                    "metric_to_track": "Second purchase rate within 30/60/90 days"
+                    "metric_to_track": "Second purchase rate within 30/60/90 days",
+                    "affected_entities": [],
+                    "affected_count": 0,
+                    "priority_rule": "new_customer_share > 20%",
                 })
         
         # 4. Cross-sell opportunities from basket analysis
@@ -3594,45 +3617,68 @@ def _generate_action_matrix(rfm: pd.DataFrame, basket_data: dict, anomaly_data: 
                     "category": "Cross-sell",
                     "title": f"Test {len(high_lift)} high-lift product bundles",
                     "impact": "Medium-High (AOV uplift)",
+                    "impact_type": "aov_uplift_potential",
                     "evidence": f"Pairs with lift > 2.0 indicate strong association (e.g., {high_lift.iloc[0]['product_a']} + {high_lift.iloc[0]['product_b']}: lift {high_lift.iloc[0]['lift']:.1f})",
                     "action": "A/B test bundle offers or placement; measure attachment rate lift",
-                    "metric_to_track": "Bundle attachment rate, AOV, units per order"
+                    "metric_to_track": "Bundle attachment rate, AOV, units per order",
+                    "affected_entities": high_lift[["product_a", "product_b", "lift", "joint_revenue"]].to_dict("records"),
+                    "affected_count": len(high_lift),
+                    "priority_rule": "high_lift_pairs_count > 0",
                 })
         
-        # 5. Category opportunities
+        # 5. Category opportunities (from category growth vs share)
         if category_data:
-            # Categories underperforming total growth
-            pass  # Could add based on category growth vs share
+            # Could add based on category growth vs share analysis
+            pass
         
         # 6. Anomaly-driven investigations
         if anomaly_data and anomaly_data.get("anomalies"):
             total_anoms = sum(len(v) for v in anomaly_data["anomalies"].values())
             if total_anoms > 0:
+                # Collect affected dates per metric
+                anomaly_details = []
+                for metric, anoms in anomaly_data["anomalies"].items():
+                    for a in anoms:
+                        anomaly_details.append({
+                            "metric": metric,
+                            "date": str(a["date"]),
+                            "pct_deviation": a["pct_deviation"],
+                            "direction": a["direction"]
+                        })
                 actions.append({
                     "priority": 5,
                     "category": "Diagnostics",
                     "title": f"Investigate {total_anoms} anomalous KPI signals",
                     "impact": "Variable",
+                    "impact_type": "risk_mitigation",
                     "evidence": f"Anomalies detected in: {', '.join(anomaly_data['anomalies'].keys())}",
                     "action": "Drill into affected segments/categories/dates; identify root cause",
-                    "metric_to_track": "Return to expected range"
+                    "metric_to_track": "Return to expected range",
+                    "affected_entities": anomaly_details,
+                    "affected_count": total_anoms,
+                    "priority_rule": "total_anomalies > 0",
                 })
         
-        # 6. Champions - protect and grow
+        # 7. Champions - protect and grow
         if "segment" in rfm.columns and "monetary" in rfm.columns:
             champions = rfm[rfm["segment"] == "Champions"]
             if len(champions) > 0:
+                champion_ids = champions["customer_id"].tolist() if "customer_id" in champions.columns else []
                 actions.append({
                     "priority": 6,
                     "category": "Growth",
                     "title": f"Deepen {len(champions)} Champions relationships",
                     "impact": fmt_currency(champions["monetary"].sum()),
-                    "evidence": "Champions = high recency, frequency, monetary",
+                    "impact_type": "future_revenue_potential",
+                    "evidence": f"Champions = high recency, frequency, monetary (total historical revenue: {fmt_currency(champions['monetary'].sum())})",
                     "action": "VIP program, early access, referral incentives, cross-category expansion",
-                    "metric_to_track": "Revenue per champion, category breadth, referral rate"
+                    "metric_to_track": "Revenue per champion, category breadth, referral rate",
+                    "affected_entities": champion_ids,
+                    "affected_count": len(champions),
+                    "priority_rule": "champions_count > 0",
                 })
         
-        # Sort by priority
+        # Sort by priority (explicit rule-based)
         actions.sort(key=lambda x: x["priority"])
         return actions
     except Exception:
@@ -3640,27 +3686,58 @@ def _generate_action_matrix(rfm: pd.DataFrame, basket_data: dict, anomaly_data: 
 
 
 def _render_action_matrix(actions: list) -> None:
-    """Render action matrix as prioritized cards."""
+    """Render action matrix as prioritized cards with affected entities and export."""
     if not actions:
         st.info("No actions generated. Run analyses to populate.")
         return
     
     st.subheader("Prioritized Action Matrix")
-    st.caption("Actions ranked by estimated revenue impact and evidence strength")
+    st.caption("Actions ranked by explicit priority rules. Each card shows affected entities (downloadable).")
     
     for action in actions:
         priority_colors = {1: "🔴", 2: "🟠", 3: "🟡", 4: "🔵", 5: "🟣", 6: "🟢"}
         icon = priority_colors.get(action["priority"], "⚪")
         
-        with st.expander(f"{icon} **Priority {action['priority']}** | {action['category']} | {action['title']}", expanded=action["priority"] <= 2):
+        affected = action.get("affected_entities", [])
+        affected_count = action.get("affected_count", len(affected) if isinstance(affected, list) else 0)
+        
+        with st.expander(f"{icon} **Priority {action['priority']}** | {action['category']} | {action['title']} ({affected_count} affected)", expanded=action["priority"] <= 2):
             col1, col2 = st.columns([2, 1])
             with col1:
                 st.markdown(f"**Evidence:** {action['evidence']}")
                 st.markdown(f"**Recommended Action:** {action['action']}")
                 st.markdown(f"**Metric to Track:** {action['metric_to_track']}")
+                st.markdown(f"**Priority Rule:** `{action.get('priority_rule', 'N/A')}`")
+                st.markdown(f"**Impact Type:** {action.get('impact_type', 'N/A')}")
+            
             with col2:
                 st.metric("Est. Impact", action["impact"])
+                st.metric("Affected", f"{affected_count:,}")
                 st.markdown(f"*Priority: {action['priority']}*")
+            
+            # Affected entities table + export
+            if affected and isinstance(affected, list) and len(affected) > 0:
+                st.markdown("---")
+                st.markdown(f"**Affected Entities ({len(affected):,})**")
+                if isinstance(affected[0], dict):
+                    # Structured data (pairs, anomalies)
+                    df_affected = pd.DataFrame(affected)
+                else:
+                    # Simple list (customer IDs)
+                    df_affected = pd.DataFrame({"entity_id": affected})
+                
+                st.dataframe(df_affected.head(100), use_container_width=True)
+                if len(df_affected) > 100:
+                    st.caption(f"Showing first 100 of {len(df_affected)}")
+                
+                csv = df_affected.to_csv(index=False).encode("utf-8")
+                st.download_button(
+                    f"Download all {len(df_affected)} entities (CSV)",
+                    csv,
+                    file_name=f"action_{action['priority']}_{action['category'].lower()}_entities.csv",
+                    mime="text/csv",
+                    key=f"dl_action_{action['priority']}_{action['category']}"
+                )
 
 
 def _plot_drilldown_path(raw_df: pd.DataFrame, period_params: dict, 
