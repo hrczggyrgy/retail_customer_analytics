@@ -3104,13 +3104,14 @@ def _compute_basket_analysis(raw_df: pd.DataFrame, period_params: dict, min_supp
         if len(freq_products) < 2:
             return {"single": prod_metrics, "pairs": pd.DataFrame()}
         
-        # Generate pairs within each basket
+        # Generate pairs within each basket - deduplicate products per invoice
         from itertools import combinations
         pairs = []
         for _, row in order_products.iterrows():
-            products = [p for p in row["products"] if p in freq_products]
+            # Deduplicate products within each invoice to avoid A-A pairs and double-counting
+            products = sorted(set(p for p in row["products"] if p in freq_products))
             if len(products) >= 2:
-                for a, b in combinations(sorted(products), 2):
+                for a, b in combinations(products, 2):
                     pairs.append((a, b))
         
         if not pairs:
@@ -3142,16 +3143,28 @@ def _compute_basket_analysis(raw_df: pd.DataFrame, period_params: dict, min_supp
         # Lift = confidence / expected probability
         pair_counts["lift"] = pair_counts["confidence_a_to_b"] / (pair_counts["orders_b"] / total_orders)
         
-        # Add revenue
-        pair_counts = pair_counts.merge(
-            prod_metrics[["product_id", "revenue"]].rename(columns={"product_id": "product_a", "revenue": "revenue_a"}),
-            on="product_a", how="left"
+        # Add joint basket revenue (revenue from invoices containing both products)
+        # Compute joint revenue by finding invoices with both products
+        joint_revenue = curr_df[curr_df["product_id"].isin(freq_products)].groupby("transaction_id").apply(
+            lambda x: x["revenue"].sum() if len(set(x["product_id"]) & set(freq_products)) >= 2 else 0
+        ).reset_index(name="joint_revenue")
+        
+        # For each pair, sum joint revenue from invoices containing both
+        pair_joint_rev = {}
+        for _, row in pair_counts.iterrows():
+            a, b = row["product_a"], row["product_b"]
+            # Find invoices containing both a and b
+            invoices_with_both = set(
+                curr_df[curr_df["product_id"] == a]["transaction_id"]
+            ) & set(
+                curr_df[curr_df["product_id"] == b]["transaction_id"]
+            )
+            joint_rev = joint_revenue[joint_revenue["transaction_id"].isin(invoices_with_both)]["joint_revenue"].sum()
+            pair_joint_rev[(a, b)] = joint_rev
+        
+        pair_counts["joint_revenue"] = pair_counts.apply(
+            lambda r: pair_joint_rev.get((r["product_a"], r["product_b"]), 0), axis=1
         )
-        pair_counts = pair_counts.merge(
-            prod_metrics[["product_id", "revenue"]].rename(columns={"product_id": "product_b", "revenue": "revenue_b"}),
-            on="product_b", how="left"
-        )
-        pair_counts["combined_revenue"] = pair_counts["revenue_a"] + pair_counts["revenue_b"]
         
         # Sort by lift
         pair_counts = pair_counts.sort_values("lift", ascending=False)
@@ -3226,7 +3239,7 @@ def _plot_basket_heatmap(pairs_df: pd.DataFrame, top_n: int = 20) -> tuple | Non
         if pairs_df.empty:
             return None
         
-        # Get top products by appearance in pairs
+        # Get all unique products from BOTH columns
         all_prods = pd.concat([pairs_df["product_a"], pairs_df["product_b"]]).unique()
         if len(all_prods) < 2:
             return None
@@ -3243,16 +3256,20 @@ def _plot_basket_heatmap(pairs_df: pd.DataFrame, top_n: int = 20) -> tuple | Non
                 pairs_df["product_b"].isin(top_prods)
             ].copy()
         
-        # Create matrix
-        products = sorted(pairs_df["product_a"].unique())
+        # Create matrix using UNION of both columns
+        products = sorted(pd.concat([pairs_df["product_a"], pairs_df["product_b"]]).unique())
         if len(products) < 2:
             return None
         
-        matrix = pd.DataFrame(1.0, index=products, columns=products)
+        # Initialize with NaN (missing = no association computed, not independence)
+        matrix = pd.DataFrame(np.nan, index=products, columns=products, dtype=float)
         
         for _, row in pairs_df.iterrows():
             matrix.loc[row["product_a"], row["product_b"]] = row["lift"]
             matrix.loc[row["product_b"], row["product_a"]] = row["lift"]
+        
+        # Mask diagonal (self-association)
+        np.fill_diagonal(matrix.values, np.nan)
         
         import matplotlib.pyplot as plt
         from matplotlib.colors import TwoSlopeNorm
