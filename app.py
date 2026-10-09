@@ -1277,20 +1277,45 @@ def tab_overview(R: dict[str, Any], raw_df: pd.DataFrame | None = None, period_p
         ]
         kpi_tile_row(kpi_metrics)
         
+        # KPI Sparkline Trends - Small multiples across recent periods
         st.markdown("---")
+        section("KPI Trends", "Recent trajectory across key metrics. Each sparkline shows the last 6 periods of the same length as your current selection.")
+        sparkline_fig = _plot_kpi_sparklines(raw_df, period_params)
+        if sparkline_fig:
+            chart_card(sparkline_fig, "Track whether improvements are sustained or one-off. Consistent upward trends across Revenue, Orders, and Customers signal healthy growth.")
         
         # Revenue Waterfall Decomposition
-        section("Revenue Change Decomposition", "What drove the revenue change? Customer count, frequency, or basket value?")
+        st.markdown("---")
+        section("Revenue Change Decomposition", "What drove the revenue change? Customer count, purchase frequency, units per order, or average unit price?")
         waterfall_data = revenue_waterfall_data(current_metrics, prior_metrics)
         fig, _ = plot_revenue_waterfall(waterfall_data)
         chart_card(fig, f"Revenue changed by {fmt_currency(current_metrics['revenue'] - prior_metrics['revenue'])} ({fmt_pct((current_metrics['revenue'] / prior_metrics['revenue'] - 1) * 100)}) vs comparison period.")
+        
+        # Category/Department Contribution to Revenue Change
+        st.markdown("---")
+        section("Category Contribution to Revenue Change", "Which categories drove growth or decline? Contribution = (category revenue change) / (total revenue change)")
+        contrib_fig = _plot_category_contribution_waterfall(raw_df, period_params)
+        if contrib_fig:
+            chart_card(contrib_fig, "Categories with the largest bars (positive or negative) are where to focus assortment, pricing, or promotion reviews.")
+        
+        # Year-over-Year Trend Comparison
+        st.markdown("---")
+        section("Year-over-Year Comparison", "Current period vs same period last year, aligned by calendar. Removes seasonality to show true performance.")
+        yoy_fig = _plot_yoy_comparison(raw_df, period_params)
+        if yoy_fig:
+            chart_card(yoy_fig, "Divergence between current and prior year lines indicates structural change, not just seasonality.")
+        
+        # Executive Narrative
+        st.markdown("---")
+        section("Executive Summary", "Automated narrative synthesizing the key drivers.")
+        _render_executive_narrative(current_metrics, prior_metrics, period_params)
     
     else:
         # Fallback to simple KPIs
         kpi_row(kpis)
     
     # Key findings from insight engine
-    st.subheader("Key Findings")
+    st.subheader("Key Findings from Models")
     by_key = {c["key"]: c for c in R["summary"].get("charts", [])}
     found = [by_key[k] for k in HEADLINE_CHARTS if k in by_key]
     if found:
@@ -1327,6 +1352,275 @@ def tab_overview(R: dict[str, Any], raw_df: pd.DataFrame | None = None, period_p
             "- **Segments** describe behaviour. They are useful only if they are stable and differ on future behaviour.\n"
             "- **Basket rules** and **transitions** are associations, not causal effects.\n"
             "- **Promo share** is a price-based proxy; no promotion field exists in the data.")
+
+
+def _plot_kpi_sparklines(raw_df: pd.DataFrame, period_params: dict) -> tuple | None:
+    """Generate small multiples sparklines for key KPIs across recent periods."""
+    try:
+        current_start = period_params["current_start"]
+        current_end = period_params["current_end"]
+        period_len = (current_end - current_start).days + 1
+        
+        # Generate 6 periods going back
+        n_periods = 6
+        periods = []
+        period_labels = []
+        
+        for i in range(n_periods):
+            p_end = current_end - pd.Timedelta(days=i * period_len)
+            p_start = p_end - pd.Timedelta(days=period_len - 1)
+            periods.append((p_start, p_end))
+            period_labels.append(p_start.strftime("%m/%d"))
+        
+        periods = list(reversed(periods))
+        period_labels = list(reversed(period_labels))
+        
+        # Compute metrics for each period
+        metric_names = ["Revenue", "Orders", "Customers", "AOV", "Units/Order", "Revenue/Cust"]
+        metric_values = {name: [] for name in metric_names}
+        
+        for p_start, p_end in periods:
+            m = compute_period_metrics(raw_df, p_start, p_end)
+            metric_values["Revenue"].append(m["revenue"])
+            metric_values["Orders"].append(m["orders"])
+            metric_values["Customers"].append(m["customers"])
+            metric_values["AOV"].append(m["aov"])
+            metric_values["Units/Order"].append(m["units_per_order"])
+            metric_values["Revenue/Cust"].append(m["revenue_per_customer"])
+        
+        # Plot
+        fig, axes = plot_kpi_sparklines(
+            period_labels, 
+            [metric_values[name] for name in metric_names],
+            metric_names
+        )
+        return fig, axes
+    except Exception:
+        return None
+
+
+def _plot_category_contribution_waterfall(raw_df: pd.DataFrame, period_params: dict) -> tuple | None:
+    """Waterfall chart showing category contribution to total revenue change."""
+    try:
+        current_start = period_params["current_start"]
+        current_end = period_params["current_end"]
+        
+        if period_params["compare_mode"] == "prior":
+            period_len = (current_end - current_start).days + 1
+            prior_end = current_start - pd.Timedelta(days=1)
+            prior_start = prior_end - pd.Timedelta(days=period_len - 1)
+        else:
+            prior_start = current_start - pd.DateOffset(years=1)
+            prior_end = current_end - pd.DateOffset(years=1)
+        
+        # Filter data
+        curr_df = raw_df[(raw_df["transaction_day"] >= current_start) & (raw_df["transaction_day"] <= current_end)].copy()
+        prior_df = raw_df[(raw_df["transaction_day"] >= prior_start) & (raw_df["transaction_day"] <= prior_end)].copy()
+        
+        if curr_df.empty or prior_df.empty:
+            return None
+        
+        curr_df["revenue"] = curr_df["quantity"] * curr_df["price"]
+        prior_df["revenue"] = prior_df["quantity"] * prior_df["price"]
+        
+        # Category revenue
+        curr_cat = curr_df.groupby("category")["revenue"].sum().reset_index()
+        prior_cat = prior_df.groupby("category")["revenue"].sum().reset_index()
+        
+        # Merge
+        merged = curr_cat.merge(prior_cat, on="category", how="outer", suffixes=("_curr", "_prior")).fillna(0)
+        merged["change"] = merged["revenue_curr"] - merged["revenue_prior"]
+        merged["pct_change"] = (merged["change"] / merged["revenue_prior"].replace(0, np.nan) * 100).round(1)
+        
+        # Sort by absolute contribution
+        total_change = merged["change"].sum()
+        if total_change == 0:
+            return None
+        
+        merged["contribution_pct"] = (merged["change"] / total_change * 100).round(1)
+        merged = merged.sort_values("change", ascending=True)
+        
+        # Take top 10 by absolute change
+        merged = merged.nlargest(10, "change", keep="all") if total_change > 0 else merged.nsmallest(10, "change", keep="all")
+        
+        # Plot
+        import matplotlib.pyplot as plt
+        fig, ax = plt.subplots(figsize=(12, 5))
+        
+        labels = [f"{row['category'][:25]} ({row['contribution_pct']:+.1f}%)" for _, row in merged.iterrows()]
+        values = merged["change"].values
+        
+        colors = ["#2f855a" if v >= 0 else "#e53e3e" for v in values]
+        bars = ax.barh(range(len(labels)), values, color=colors, edgecolor='white', height=0.6)
+        
+        ax.set_yticks(range(len(labels)))
+        ax.set_yticklabels(labels, fontsize=9)
+        ax.set_xlabel("Revenue Change", fontsize=10)
+        ax.set_title("Category Contribution to Revenue Change", fontsize=13, fontweight='bold', pad=15)
+        ax.axvline(x=0, color='gray', linewidth=0.5)
+        ax.spines['top'].set_visible(False)
+        ax.spines['right'].set_visible(False)
+        ax.grid(axis='x', alpha=0.3)
+        ax.xaxis.set_major_formatter(plt.FuncFormatter(lambda x, _: fmt_currency(x)))
+        
+        # Add value labels
+        for bar, val in zip(bars, values):
+            ax.text(val + (max(values) - min(values)) * 0.01 if val >= 0 else val - (max(values) - min(values)) * 0.01,
+                   bar.get_y() + bar.get_height()/2,
+                   fmt_currency(val), va='center', ha='left' if val >= 0 else 'right', fontsize=9, fontweight='bold')
+        
+        plt.tight_layout()
+        return fig, ax
+    except Exception:
+        return None
+
+
+def _plot_yoy_comparison(raw_df: pd.DataFrame, period_params: dict) -> tuple | None:
+    """Year-over-year trend comparison aligned by week/month."""
+    try:
+        current_start = period_params["current_start"]
+        current_end = period_params["current_end"]
+        
+        # Compare to same period last year
+        prior_start = current_start - pd.DateOffset(years=1)
+        prior_end = current_end - pd.DateOffset(years=1)
+        
+        # Determine granularity based on period length
+        period_days = (current_end - current_start).days + 1
+        if period_days <= 14:
+            freq = "D"
+            date_fmt = "%m/%d"
+        elif period_days <= 60:
+            freq = "W-MON"
+            date_fmt = "%m/%d"
+        else:
+            freq = "M"
+            date_fmt = "%b %Y"
+        
+        curr_df = raw_df[(raw_df["transaction_day"] >= current_start) & (raw_df["transaction_day"] <= current_end)].copy()
+        prior_df = raw_df[(raw_df["transaction_day"] >= prior_start) & (raw_df["transaction_day"] <= prior_end)].copy()
+        
+        if curr_df.empty or prior_df.empty:
+            return None
+        
+        curr_df["revenue"] = curr_df["quantity"] * curr_df["price"]
+        prior_df["revenue"] = prior_df["quantity"] * prior_df["price"]
+        
+        # Resample
+        curr_ts = curr_df.set_index("transaction_day")["revenue"].resample(freq).sum()
+        prior_ts = prior_df.set_index("transaction_day")["revenue"].resample(freq).sum()
+        
+        # Align indices for plotting
+        curr_labels = [d.strftime(date_fmt) for d in curr_ts.index]
+        prior_labels = [d.strftime(date_fmt) for d in prior_ts.index]
+        
+        import matplotlib.pyplot as plt
+        fig, ax = plt.subplots(figsize=(12, 5))
+        
+        ax.plot(range(len(curr_ts)), curr_ts.values, 'o-', color='#2b6cb0', linewidth=2, label=f'Current ({current_start.strftime("%Y")})', markersize=5)
+        ax.plot(range(len(prior_ts)), prior_ts.values, 's--', color='#a0aec0', linewidth=1.5, label=f'Prior Year ({prior_start.strftime("%Y")})', markersize=4)
+        
+        ax.fill_between(range(len(curr_ts)), curr_ts.values, alpha=0.1, color='#2b6cb0')
+        ax.fill_between(range(len(prior_ts)), prior_ts.values, alpha=0.1, color='#a0aec0')
+        
+        ax.set_xticks(range(len(curr_labels)))
+        ax.set_xticklabels(curr_labels, rotation=30, ha='right', fontsize=9)
+        ax.set_ylabel("Revenue", fontsize=10)
+        ax.set_title(f"Year-over-Year Revenue Comparison ({freq} granularity)", fontsize=13, fontweight='bold', pad=15)
+        ax.legend(fontsize=10, loc='upper left')
+        ax.spines['top'].set_visible(False)
+        ax.spines['right'].set_visible(False)
+        ax.grid(axis='y', alpha=0.3)
+        ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, _: fmt_currency(x)))
+        
+        # Add growth rate annotations at the end
+        if len(curr_ts) > 0 and len(prior_ts) > 0:
+            curr_total = curr_ts.sum()
+            prior_total = prior_ts.sum()
+            if prior_total > 0:
+                growth = (curr_total / prior_total - 1) * 100
+                ax.annotate(f"Total: {fmt_pct(growth)} YoY", 
+                           xy=(0.98, 0.95), xycoords='axes fraction',
+                           ha='right', va='top', fontsize=11, fontweight='bold',
+                           color='#2f855a' if growth >= 0 else '#e53e3e',
+                           bbox=dict(boxstyle='round,pad=0.3', facecolor='white', edgecolor='gray', alpha=0.9))
+        
+        plt.tight_layout()
+        return fig, ax
+    except Exception:
+        return None
+
+
+def _render_executive_narrative(current_metrics: dict, prior_metrics: dict, period_params: dict) -> None:
+    """Generate and render an executive narrative summarizing key drivers."""
+    rev_change = current_metrics["revenue"] - prior_metrics["revenue"]
+    rev_pct = (current_metrics["revenue"] / prior_metrics["revenue"] - 1) * 100 if prior_metrics["revenue"] > 0 else 0
+    
+    # Decompose drivers
+    c_cust = current_metrics["customers"]
+    c_freq = current_metrics["orders_per_customer"]
+    c_aov = current_metrics["aov"]
+    c_upo = current_metrics["units_per_order"]
+    c_aup = current_metrics["avg_unit_price"]
+    
+    p_cust = prior_metrics["customers"]
+    p_freq = prior_metrics["orders_per_customer"]
+    p_aov = prior_metrics["aov"]
+    p_upo = prior_metrics["units_per_order"]
+    p_aup = prior_metrics["avg_unit_price"]
+    
+    # Contributions
+    cust_effect = (c_cust - p_cust) * p_freq * p_aov
+    freq_effect = c_cust * (c_freq - p_freq) * p_aov
+    upo_effect = c_cust * c_freq * (c_upo - p_upo) * p_aup
+    aup_effect = c_cust * c_freq * c_upo * (c_aup - p_aup)
+    
+    effects = {
+        "Customer Count": cust_effect,
+        "Purchase Frequency": freq_effect,
+        "Units per Order": upo_effect,
+        "Average Unit Price": aup_effect,
+    }
+    
+    # Find primary driver
+    primary_driver = max(effects.items(), key=lambda x: abs(x[1]))
+    
+    direction = "increased" if rev_change >= 0 else "decreased"
+    primary_name, primary_val = primary_driver
+    primary_pct = (abs(primary_val) / abs(rev_change) * 100) if rev_change != 0 else 0
+    
+    # Build narrative
+    narrative = f"""
+    **Revenue {direction} {fmt_pct(rev_pct)}** ({fmt_currency(abs(rev_change))}) versus the comparison period.
+    
+    The primary driver was **{primary_name}**, explaining **{primary_pct:.0f}%** of the total change ({fmt_currency(primary_val)}).
+    """
+    
+    # Add secondary drivers
+    sorted_effects = sorted(effects.items(), key=lambda x: abs(x[1]), reverse=True)
+    for name, val in sorted_effects[1:3]:
+        if abs(val) > 0.01 * abs(rev_change):
+            pct = (abs(val) / abs(rev_change) * 100) if rev_change != 0 else 0
+            narrative += f"\n\n- **{name}** contributed {fmt_currency(val)} ({pct:.0f}% of change)."
+    
+    # Add context on metric health
+    narrative += "\n\n**Metric Health:**"
+    if current_metrics["customers"] >= prior_metrics["customers"]:
+        narrative += f" ✅ Customer base **grew** ({fmt_pct((c_cust/p_cust - 1)*100) if p_cust > 0 else 'N/A'})"
+    else:
+        narrative += f" ⚠️ Customer base **shrank** ({fmt_pct((c_cust/p_cust - 1)*100) if p_cust > 0 else 'N/A'})"
+    
+    if current_metrics["aov"] >= prior_metrics["aov"]:
+        narrative += f" | ✅ AOV **improved** ({fmt_pct((c_aov/p_aov - 1)*100) if p_aov > 0 else 'N/A'})"
+    else:
+        narrative += f" | ⚠️ AOV **declined** ({fmt_pct((c_aov/p_aov - 1)*100) if p_aov > 0 else 'N/A'})"
+    
+    if current_metrics["units_per_order"] >= prior_metrics["units_per_order"]:
+        narrative += f" | ✅ Basket size **grew** ({fmt_pct((c_upo/p_upo - 1)*100) if p_upo > 0 else 'N/A'})"
+    else:
+        narrative += f" | ⚠️ Basket size **shrank** ({fmt_pct((c_upo/p_upo - 1)*100) if p_upo > 0 else 'N/A'})"
+    
+    st.markdown(narrative)
 
 
 def tab_trust(R: dict[str, Any]) -> None:
@@ -1698,13 +1992,704 @@ def tab_data(R: dict[str, Any]) -> None:
         c4.download_button("Written report (Markdown)", rp.read_bytes(), file_name="analysis_report.md", mime="text/markdown")
 
 
-# --------------------------------------------------------------------------- #
-# New Tab Functions - Phase 2
-# --------------------------------------------------------------------------- #
+def _plot_customer_pareto(rfm: pd.DataFrame) -> tuple | None:
+    """Pareto chart of customers by lifetime revenue."""
+    try:
+        if "monetary" not in rfm.columns:
+            return None
+        
+        pareto = rfm.nlargest(min(200, len(rfm)), "monetary").sort_values("monetary", ascending=False).reset_index(drop=True)
+        pareto["cum_pct"] = pareto["monetary"].cumsum() / pareto["monetary"].sum() * 100
+        pareto["rank"] = range(1, len(pareto) + 1)
+        
+        import matplotlib.pyplot as plt
+        fig, ax1 = plt.subplots(figsize=(12, 5))
+        
+        bars = ax1.bar(range(len(pareto)), pareto["monetary"], color="#2b6cb0", edgecolor='white', width=0.7)
+        ax1.set_ylabel("Lifetime Revenue", fontsize=10, color="#2b6cb0")
+        ax1.tick_params(axis='y', labelcolor="#2b6cb0")
+        ax1.set_xticks(range(0, len(pareto), max(1, len(pareto)//20)))
+        ax1.set_xticklabels([str(r) for r in pareto["rank"].iloc[::max(1, len(pareto)//20)]], fontsize=8)
+        ax1.set_xlabel("Customer Rank (by Lifetime Revenue)", fontsize=10)
+        
+        ax2 = ax1.twinx()
+        ax2.plot(range(len(pareto)), pareto["cum_pct"], color="#e53e3e", marker='o', linewidth=2, markersize=3)
+        ax2.set_ylabel("Cumulative %", fontsize=10, color="#e53e3e")
+        ax2.tick_params(axis='y', labelcolor="#e53e3e")
+        ax2.axhline(y=80, color='gray', linestyle='--', alpha=0.5, linewidth=1)
+        ax2.text(len(pareto)-1, 82, "80% threshold", fontsize=8, color='gray')
+        
+        # Add reference lines for top tiers
+        n = len(pareto)
+        for pct, label in [(1, "Top 1%"), (5, "Top 5%"), (10, "Top 10%"), (20, "Top 20%")]:
+            idx = int(n * pct / 100)
+            if idx < n:
+                ax1.axvline(x=idx, color='gray', linestyle=':', alpha=0.5, linewidth=1)
+                ax1.text(idx, ax1.get_ylim()[1]*0.95, label, fontsize=7, rotation=90, va='top', ha='right', color='gray')
+        
+        ax1.set_title("Customer Lifetime Value Pareto (Observed Historical)", fontsize=13, fontweight='bold', pad=15)
+        ax1.spines['top'].set_visible(False)
+        ax2.spines['top'].set_visible(False)
+        
+        plt.tight_layout()
+        return fig, (ax1, ax2)
+    except Exception:
+        return None
+
+
+def _plot_customer_lorenz(rfm: pd.DataFrame) -> tuple | None:
+    """Lorenz curve for customer revenue concentration."""
+    try:
+        if "monetary" not in rfm.columns:
+            return None
+        
+        vals = rfm["monetary"].dropna().values
+        vals = vals[vals > 0]
+        if len(vals) < 2:
+            return None
+        
+        vals = np.sort(vals)
+        x = np.concatenate([[0], np.arange(1, len(vals) + 1) / len(vals)])
+        y = np.concatenate([[0], np.cumsum(vals) / vals.sum()])
+        gini = 1 - 2 * np.trapz(y, x)
+        
+        import matplotlib.pyplot as plt
+        fig, ax = plt.subplots(figsize=(7, 6))
+        ax.plot(x, y, color="#2b6cb0", lw=2, label=f"Observed (Gini {gini:.2f})")
+        ax.plot([0, 1], [0, 1], "--", color="#1a202c", lw=1, label="Equality")
+        
+        # Shade area
+        ax.fill_between(x, y, x, alpha=0.1, color="#2b6cb0")
+        
+        # Reference points
+        for pct in [0.5, 0.8, 0.9, 0.95, 0.99]:
+            idx = int(pct * len(x))
+            if idx < len(x):
+                ax.plot(x[idx], y[idx], 'o', color="#e53e3e", markersize=4)
+                ax.annotate(f"Top {int((1-pct)*100)}%: {y[idx]*100:.1f}% revenue", 
+                           xy=(x[idx], y[idx]), xytext=(5, -15), textcoords='offset points',
+                           fontsize=8, color="#e53e3e")
+        
+        ax.set_xlabel("Cumulative Share of Customers", fontsize=10)
+        ax.set_ylabel("Cumulative Share of Revenue", fontsize=10)
+        ax.xaxis.set_major_formatter(plt.FuncFormatter(lambda v, _: f"{100*v:.0f}%"))
+        ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, _: f"{100*v:.0f}%"))
+        ax.set_title("Revenue Concentration: Lorenz Curve", fontsize=13, fontweight='bold', pad=15)
+        ax.legend(loc="upper left")
+        ax.grid(alpha=0.3)
+        ax.spines['top'].set_visible(False)
+        ax.spines['right'].set_visible(False)
+        
+        plt.tight_layout()
+        return fig, ax
+    except Exception:
+        return None
+
+
+def _plot_customer_value_tiers(rfm: pd.DataFrame) -> tuple | None:
+    """Stacked bar: customer count share vs revenue share by value tier."""
+    try:
+        if "monetary" not in rfm.columns:
+            return None
+        
+        n = len(rfm)
+        rfm_sorted = rfm.sort_values("monetary", ascending=False).reset_index(drop=True)
+        rfm_sorted["cum_revenue_pct"] = rfm_sorted["monetary"].cumsum() / rfm_sorted["monetary"].sum() * 100
+        rfm_sorted["cum_customer_pct"] = np.arange(1, n+1) / n * 100
+        
+        # Define tiers
+        tiers = [
+            ("Top 1%", 0, 1),
+            ("Top 5%", 1, 5),
+            ("Top 10%", 5, 10),
+            ("Top 20%", 10, 20),
+            ("Middle 50%", 20, 70),
+            ("Bottom 30%", 70, 100),
+        ]
+        
+        tier_data = []
+        for label, pct_start, pct_end in tiers:
+            start_idx = int(n * pct_start / 100)
+            end_idx = int(n * pct_end / 100)
+            tier_customers = rfm_sorted.iloc[start_idx:end_idx]
+            if len(tier_customers) == 0:
+                continue
+            tier_data.append({
+                "tier": label,
+                "customers": len(tier_customers),
+                "customer_pct": len(tier_customers) / n * 100,
+                "revenue": tier_customers["monetary"].sum(),
+                "revenue_pct": tier_customers["monetary"].sum() / rfm["monetary"].sum() * 100,
+                "avg_revenue": tier_customers["monetary"].mean(),
+            })
+        
+        tier_df = pd.DataFrame(tier_data)
+        
+        import matplotlib.pyplot as plt
+        fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+        
+        # Customer share
+        colors = ["#2b6cb0", "#2f855a", "#38a169", "#4299e1", "#a0aec0", "#718096"]
+        bars1 = axes[0].barh(range(len(tier_df)), tier_df["customer_pct"], color=colors[:len(tier_df)], edgecolor='white')
+        axes[0].set_xlabel("Share of Customers (%)", fontsize=10)
+        axes[0].set_title("Customer Count by Value Tier", fontsize=12, fontweight='bold')
+        axes[0].set_yticks(range(len(tier_df)))
+        axes[0].set_yticklabels(tier_df["tier"], fontsize=9)
+        axes[0].invert_yaxis()
+        axes[0].spines['top'].set_visible(False)
+        axes[0].spines['right'].set_visible(False)
+        axes[0].grid(axis='x', alpha=0.3)
+        
+        for bar, val in zip(bars1, tier_df["customer_pct"]):
+            axes[0].text(val + 0.5, bar.get_y() + bar.get_height()/2, f"{val:.1f}%", va='center', fontsize=9)
+        
+        # Revenue share
+        bars2 = axes[1].barh(range(len(tier_df)), tier_df["revenue_pct"], color=colors[:len(tier_df)], edgecolor='white')
+        axes[1].set_xlabel("Share of Revenue (%)", fontsize=10)
+        axes[1].set_title("Revenue by Value Tier", fontsize=12, fontweight='bold')
+        axes[1].set_yticks(range(len(tier_df)))
+        axes[1].set_yticklabels(tier_df["tier"], fontsize=9)
+        axes[1].invert_yaxis()
+        axes[1].spines['top'].set_visible(False)
+        axes[1].spines['right'].set_visible(False)
+        axes[1].grid(axis='x', alpha=0.3)
+        
+        for bar, val in zip(bars2, tier_df["revenue_pct"]):
+            axes[1].text(val + 0.5, bar.get_y() + bar.get_height()/2, f"{val:.1f}%", va='center', fontsize=9)
+        
+        plt.tight_layout()
+        return fig, axes
+    except Exception:
+        return None
+
+
+def _compute_retention_metrics(raw_df: pd.DataFrame, period_params: dict) -> dict:
+    """Compute retention, repeat purchase, reactivation metrics."""
+    try:
+        current_start = period_params["current_start"]
+        current_end = period_params["current_end"]
+        
+        if period_params["compare_mode"] == "prior":
+            period_len = (current_end - current_start).days + 1
+            prior_end = current_start - pd.Timedelta(days=1)
+            prior_start = prior_end - pd.Timedelta(days=period_len - 1)
+        else:
+            prior_start = current_start - pd.DateOffset(years=1)
+            prior_end = current_end - pd.DateOffset(years=1)
+        
+        curr_df = raw_df[
+            (raw_df["transaction_day"] >= current_start) & 
+            (raw_df["transaction_day"] <= current_end)
+        ].copy()
+        prior_df = raw_df[
+            (raw_df["transaction_day"] >= prior_start) & 
+            (raw_df["transaction_day"] <= prior_end)
+        ].copy()
+        
+        curr_customers = set(curr_df["customer_id"].dropna().unique())
+        prior_customers = set(prior_df["customer_id"].dropna().unique())
+        
+        # All-time customers up to current period start
+        all_time_df = raw_df[raw_df["transaction_day"] < current_start].copy()
+        all_time_customers = set(all_time_df["customer_id"].dropna().unique())
+        
+        # Retention: customers active in both periods
+        retained = curr_customers & prior_customers
+        retention_rate = len(retained) / len(prior_customers) if prior_customers else 0
+        
+        # Reactivation: dormant customers (active before prior, not in prior, but in current)
+        dormant = all_time_customers - prior_customers
+        reactivated = dormant & curr_customers
+        reactivation_rate = len(reactivated) / len(dormant) if dormant else 0
+        
+        # New customers: first purchase in current period
+        new_customers = curr_customers - all_time_customers
+        new_customer_share = len(new_customers) / len(curr_customers) if curr_customers else 0
+        
+        # Repeat purchase rate (all time)
+        all_purchases = raw_df[raw_df["transaction_day"] <= current_end].copy()
+        cust_orders = all_purchases.groupby("customer_id")["transaction_id"].nunique()
+        repeat_cust = (cust_orders > 1).sum()
+        total_cust = len(cust_orders)
+        repeat_purchase_rate = repeat_cust / total_cust if total_cust > 0 else 0
+        
+        # Repeat revenue share
+        all_purchases["revenue"] = all_purchases["quantity"] * all_purchases["price"]
+        repeat_revenue = all_purchases[all_purchases["customer_id"].isin(cust_orders[cust_orders > 1].index)]["revenue"].sum()
+        total_revenue = all_purchases["revenue"].sum()
+        repeat_revenue_share = repeat_revenue / total_revenue if total_revenue > 0 else 0
+        
+        # Churned valuable: top 20% by historical revenue, not in current
+        hist_rev = all_purchases.groupby("customer_id")["revenue"].sum().sort_values(ascending=False)
+        top_20_pct = int(len(hist_rev) * 0.2)
+        valuable_cust = set(hist_rev.head(top_20_pct).index) if top_20_pct > 0 else set()
+        churned_valuable = valuable_cust - curr_customers
+        
+        return {
+            "retention_rate": retention_rate,
+            "reactivation_rate": reactivation_rate,
+            "new_customer_share": new_customer_share,
+            "repeat_purchase_rate": repeat_purchase_rate,
+            "repeat_revenue_share": repeat_revenue_share,
+            "curr_customers": len(curr_customers),
+            "prior_customers": len(prior_customers),
+            "retained": len(retained),
+            "reactivated": len(reactivated),
+            "new_customers": len(new_customers),
+            "churned_valuable_count": len(churned_valuable),
+            "churned_valuable_revenue": hist_rev.loc[list(churned_valuable)].sum() if churned_valuable else 0,
+        }
+    except Exception:
+        return {}
+
+
+def _plot_retention_metrics(metrics: dict) -> tuple | None:
+    """Bullet chart for retention metrics."""
+    try:
+        import matplotlib.pyplot as plt
+        fig, ax = plt.subplots(figsize=(10, 4))
+        
+        metrics_list = [
+            ("Retention Rate", metrics.get("retention_rate", 0)),
+            ("Reactivation Rate", metrics.get("reactivation_rate", 0)),
+            ("Repeat Purchase Rate", metrics.get("repeat_purchase_rate", 0)),
+            ("Repeat Revenue Share", metrics.get("repeat_revenue_share", 0)),
+            ("New Customer Share", metrics.get("new_customer_share", 0)),
+        ]
+        
+        y_pos = np.arange(len(metrics_list))
+        values = [m[1] for m in metrics_list]
+        labels = [m[0] for m in metrics_list]
+        
+        bars = ax.barh(y_pos, [v * 100 for v in values], color="#2b6cb0", edgecolor='white', height=0.6)
+        ax.set_yticks(y_pos)
+        ax.set_yticklabels(labels, fontsize=10)
+        ax.set_xlabel("Rate (%)", fontsize=10)
+        ax.set_title("Retention & Loyalty Metrics", fontsize=13, fontweight='bold', pad=15)
+        ax.set_xlim(0, 100)
+        ax.spines['top'].set_visible(False)
+        ax.spines['right'].set_visible(False)
+        ax.grid(axis='x', alpha=0.3)
+        
+        for bar, val in zip(bars, values):
+            ax.text(bar.get_width() + 1, bar.get_y() + bar.get_height()/2, 
+                   f"{val*100:.1f}%", va='center', fontsize=10, fontweight='bold')
+        
+        # Add reference lines
+        for ref in [20, 40, 60, 80]:
+            ax.axvline(ref, color='gray', linestyle=':', alpha=0.3, linewidth=0.5)
+        
+        plt.tight_layout()
+        return fig, ax
+    except Exception:
+        return None
+
+
+def _plot_category_contribution(raw_df: pd.DataFrame, period_params: dict) -> tuple | None:
+    """Category growth vs share scatter plot."""
+    try:
+        current_start = period_params["current_start"]
+        current_end = period_params["current_end"]
+        
+        if period_params["compare_mode"] == "prior":
+            period_len = (current_end - current_start).days + 1
+            prior_end = current_start - pd.Timedelta(days=1)
+            prior_start = prior_end - pd.Timedelta(days=period_len - 1)
+        else:
+            prior_start = current_start - pd.DateOffset(years=1)
+            prior_end = current_end - pd.DateOffset(years=1)
+        
+        curr_df = raw_df[
+            (raw_df["transaction_day"] >= current_start) & 
+            (raw_df["transaction_day"] <= current_end)
+        ].copy()
+        prior_df = raw_df[
+            (raw_df["transaction_day"] >= prior_start) & 
+            (raw_df["transaction_day"] <= prior_end)
+        ].copy()
+        
+        if curr_df.empty or prior_df.empty:
+            return None
+        
+        curr_df["revenue"] = curr_df["quantity"] * curr_df["price"]
+        prior_df["revenue"] = prior_df["quantity"] * prior_df["price"]
+        
+        curr_cat = curr_df.groupby("category").agg(
+            revenue=("revenue", "sum"),
+            orders=("transaction_id", "nunique"),
+            customers=("customer_id", "nunique"),
+        ).reset_index()
+        
+        prior_cat = prior_df.groupby("category").agg(
+            revenue=("revenue", "sum"),
+        ).reset_index()
+        prior_cat.columns = ["category", "prior_revenue"]
+        
+        merged = curr_cat.merge(prior_cat, on="category", how="outer").fillna(0)
+        merged["revenue_change"] = merged["revenue"] - merged["prior_revenue"]
+        merged["growth"] = (merged["revenue_change"] / merged["prior_revenue"].replace(0, np.nan) * 100)
+        total_rev = merged["revenue"].sum()
+        merged["share"] = merged["revenue"] / total_rev * 100
+        
+        # Filter to categories with meaningful revenue
+        merged = merged[merged["revenue"] > total_rev * 0.005].copy()  # >0.5% of revenue
+        
+        import matplotlib.pyplot as plt
+        fig, ax = plt.subplots(figsize=(10, 7))
+        
+        # Quadrant lines
+        total_growth = (curr_df["quantity"] * curr_df["price"]).sum() / (prior_df["quantity"] * prior_df["price"]).sum() * 100 - 100 if (prior_df["quantity"] * prior_df["price"]).sum() > 0 else 0
+        ax.axvline(total_growth, color='gray', linestyle='--', alpha=0.5, linewidth=1, label=f'Total Business: {total_growth:.1f}%')
+        ax.axhline(merged["share"].median(), color='gray', linestyle='--', alpha=0.5, linewidth=1)
+        
+        # Scatter
+        scatter = ax.scatter(merged["growth"], merged["share"], 
+                           s=merged["revenue"] / merged["revenue"].max() * 2000 + 50,
+                           c=merged["revenue_change"], cmap="RdYlGn", alpha=0.7, 
+                           edgecolors='white', linewidth=0.5)
+        
+        # Labels
+        for _, row in merged.iterrows():
+            ax.annotate(row["category"][:20], 
+                       (row["growth"], row["share"]),
+                       xytext=(3, 3), textcoords='offset points',
+                       fontsize=8, alpha=0.8)
+        
+        ax.set_xlabel("Revenue Growth (%)", fontsize=10)
+        ax.set_ylabel("Revenue Share (%)", fontsize=10)
+        ax.set_title("Category Performance: Growth vs Share", fontsize=13, fontweight='bold', pad=15)
+        
+        # Quadrant labels
+        xlim = ax.get_xlim()
+        ylim = ax.get_ylim()
+        ax.text(xlim[1]*0.95, ylim[1]*0.95, "SCALE DRIVERS\n(High Share, High Growth)", 
+               ha='right', va='top', fontsize=9, bbox=dict(boxstyle='round', facecolor='#c6f6d5', alpha=0.7))
+        ax.text(xlim[0]*0.95, ylim[1]*0.95, "EMERGING\n(Low Share, High Growth)", 
+               ha='left', va='top', fontsize=9, bbox=dict(boxstyle='round', facecolor='#bee3f8', alpha=0.7))
+        ax.text(xlim[1]*0.95, ylim[0]*1.05, "DECLINING PRIORITIES\n(High Share, Low Growth)", 
+               ha='right', va='bottom', fontsize=9, bbox=dict(boxstyle='round', facecolor='#fed7d7', alpha=0.7))
+        ax.text(xlim[0]*0.95, ylim[0]*1.05, "SMALL DECLINES\n(Low Share, Low Growth)", 
+               ha='left', va='bottom', fontsize=9, bbox=dict(boxstyle='round', facecolor='#feebc8', alpha=0.7))
+        
+        plt.colorbar(scatter, ax=ax, label="Revenue Change")
+        ax.spines['top'].set_visible(False)
+        ax.spines['right'].set_visible(False)
+        ax.grid(alpha=0.3)
+        
+        plt.tight_layout()
+        return fig, ax
+    except Exception:
+        return None
+
+
+def _plot_category_mix_trend(raw_df: pd.DataFrame, period_params: dict) -> tuple | None:
+    """Stacked area chart of category revenue mix over time."""
+    try:
+        current_start = period_params["current_start"]
+        current_end = period_params["current_end"]
+        
+        if period_params["compare_mode"] == "prior":
+            period_len = (current_end - current_start).days + 1
+            prior_end = current_start - pd.Timedelta(days=1)
+            prior_start = prior_end - pd.Timedelta(days=period_len - 1)
+        else:
+            prior_start = current_start - pd.DateOffset(years=1)
+            prior_end = current_end - pd.DateOffset(years=1)
+        
+        # Use wider window for trend
+        full_start = min(prior_start, current_start) - pd.Timedelta(days=90)
+        full_end = max(prior_end, current_end)
+        
+        df = raw_df[
+            (raw_df["transaction_day"] >= full_start) & 
+            (raw_df["transaction_day"] <= full_end)
+        ].copy()
+        
+        if df.empty:
+            return None
+        
+        df["revenue"] = df["quantity"] * df["price"]
+        
+        # Determine granularity
+        period_days = (full_end - full_start).days
+        if period_days <= 60:
+            freq = "W-MON"
+        else:
+            freq = "M"
+        
+        # Get top 6 categories by revenue
+        top_cats = df.groupby("category")["revenue"].sum().nlargest(6).index
+        df["category"] = df["category"].where(df["category"].isin(top_cats), "Other")
+        
+        # Pivot
+        pivot = df.groupby([pd.Grouper(key="transaction_day", freq=freq), "category"])["revenue"].sum().unstack(fill_value=0)
+        
+        import matplotlib.pyplot as plt
+        fig, ax = plt.subplots(figsize=(12, 5))
+        
+        colors = ["#2b6cb0", "#2f855a", "#dd6b20", "#6b46c1", "#975a16", "#d53f8c", "#a0aec0"]
+        pivot.plot.area(ax=ax, color=colors[:len(pivot.columns)], alpha=0.7)
+        
+        # Highlight current period
+        ax.axvspan(current_start, current_end, alpha=0.15, color='yellow', label='Current Period')
+        if period_params["compare_mode"] == "prior":
+            ax.axvspan(prior_start, prior_end, alpha=0.15, color='blue', label='Prior Period')
+        else:
+            ax.axvspan(prior_start, prior_end, alpha=0.15, color='orange', label='Prior Year')
+        
+        ax.set_ylabel("Revenue", fontsize=10)
+        ax.set_title(f"Category Revenue Mix Over Time ({freq} granularity)", fontsize=13, fontweight='bold', pad=15)
+        ax.legend(loc='upper left', fontsize=8, ncol=2)
+        ax.spines['top'].set_visible(False)
+        ax.spines['right'].set_visible(False)
+        ax.grid(axis='y', alpha=0.3)
+        ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, _: fmt_currency(x)))
+        
+        fig.autofmt_xdate(rotation=30)
+        plt.tight_layout()
+        return fig, ax
+    except Exception:
+        return None
+
+
+def _plot_product_quadrant(raw_df: pd.DataFrame, period_params: dict, prod_summary: pd.DataFrame) -> tuple | None:
+    """Quadrant scatter: basket penetration vs revenue per order."""
+    try:
+        current_start = period_params["current_start"]
+        current_end = period_params["current_end"]
+        
+        curr_df = raw_df[
+            (raw_df["transaction_day"] >= current_start) & 
+            (raw_df["transaction_day"] <= current_end)
+        ].copy()
+        
+        if curr_df.empty:
+            return None
+        
+        curr_df["revenue"] = curr_df["quantity"] * curr_df["price"]
+        total_orders = curr_df["transaction_id"].nunique()
+        
+        # Product metrics
+        prod_metrics = curr_df.groupby("product_id").agg(
+            revenue=("revenue", "sum"),
+            orders=("transaction_id", "nunique"),
+            units=("quantity", "sum"),
+        ).reset_index()
+        
+        prod_metrics["basket_penetration"] = prod_metrics["orders"] / total_orders * 100
+        prod_metrics["rev_per_order"] = prod_metrics["revenue"] / prod_metrics["orders"]
+        
+        # Merge with descriptions
+        prod_metrics = prod_metrics.merge(prod_summary[["product_id", "product_description", "category", "department"]], on="product_id", how="left")
+        
+        # Filter to top products by revenue
+        top_prods = prod_metrics.nlargest(50, "revenue")
+        
+        import matplotlib.pyplot as plt
+        fig, ax = plt.subplots(figsize=(10, 7))
+        
+        # Color by department
+        dept_colors = {d: c for d, c in zip(top_prods["department"].unique(), ["#2b6cb0", "#2f855a", "#dd6b20", "#6b46c1", "#975a16", "#d53f8c"])}
+        
+        for dept in top_prods["department"].unique():
+            dept_data = top_prods[top_prods["department"] == dept]
+            ax.scatter(dept_data["basket_penetration"], dept_data["rev_per_order"],
+                      s=dept_data["revenue"] / top_prods["revenue"].max() * 1000 + 50,
+                      alpha=0.6, label=dept, color=dept_colors.get(dept, "#4a5568"),
+                      edgecolors='white', linewidth=0.5)
+        
+        # Quadrant lines
+        med_pen = top_prods["basket_penetration"].median()
+        med_rev = top_prods["rev_per_order"].median()
+        ax.axvline(med_pen, color='gray', linestyle='--', alpha=0.5)
+        ax.axhline(med_rev, color='gray', linestyle='--', alpha=0.5)
+        
+        # Quadrant labels
+        ax.text(0.95, 0.95, "PREMIUM ADD-ONS\n(High Rev/Order, Low Penetration)", transform=ax.transAxes,
+               ha='right', va='top', fontsize=9, bbox=dict(boxstyle='round', facecolor='#bee3f8', alpha=0.7))
+        ax.text(0.95, 0.05, "TRAFFIC DRIVERS\n(High Rev/Order, High Penetration)", transform=ax.transAxes,
+               ha='right', va='bottom', fontsize=9, bbox=dict(boxstyle='round', facecolor='#c6f6d5', alpha=0.7))
+        ax.text(0.05, 0.95, "LOW IMPACT\n(Low Rev/Order, Low Penetration)", transform=ax.transAxes,
+               ha='left', va='top', fontsize=9, bbox=dict(boxstyle='round', facecolor='#feebc8', alpha=0.7))
+        ax.text(0.05, 0.05, "VOLUME DRIVERS\n(Low Rev/Order, High Penetration)", transform=ax.transAxes,
+               ha='left', va='bottom', fontsize=9, bbox=dict(boxstyle='round', facecolor='#fed7d7', alpha=0.7))
+        
+        ax.set_xlabel("Basket Penetration (% of orders)", fontsize=10)
+        ax.set_ylabel("Revenue per Order", fontsize=10)
+        ax.set_title("Product Portfolio: Penetration vs Revenue per Order", fontsize=13, fontweight='bold', pad=15)
+        ax.legend(fontsize=8, loc='upper right')
+        ax.spines['top'].set_visible(False)
+        ax.spines['right'].set_visible(False)
+        ax.grid(alpha=0.3)
+        
+        plt.tight_layout()
+        return fig, ax
+    except Exception:
+        return None
+
+
+def _plot_product_rank_change(raw_df: pd.DataFrame, period_params: dict, prod_summary: pd.DataFrame) -> tuple | None:
+    """Rank change chart: current vs prior period product revenue rank."""
+    try:
+        current_start = period_params["current_start"]
+        current_end = period_params["current_end"]
+        
+        if period_params["compare_mode"] == "prior":
+            period_len = (current_end - current_start).days + 1
+            prior_end = current_start - pd.Timedelta(days=1)
+            prior_start = prior_end - pd.Timedelta(days=period_len - 1)
+        else:
+            prior_start = current_start - pd.DateOffset(years=1)
+            prior_end = current_end - pd.DateOffset(years=1)
+        
+        curr_df = raw_df[
+            (raw_df["transaction_day"] >= current_start) & 
+            (raw_df["transaction_day"] <= current_end)
+        ].copy()
+        prior_df = raw_df[
+            (raw_df["transaction_day"] >= prior_start) & 
+            (raw_df["transaction_day"] <= prior_end)
+        ].copy()
+        
+        if curr_df.empty or prior_df.empty:
+            return None
+        
+        curr_df["revenue"] = curr_df["quantity"] * curr_df["price"]
+        prior_df["revenue"] = prior_df["quantity"] * prior_df["price"]
+        
+        curr_rank = curr_df.groupby("product_id")["revenue"].sum().sort_values(ascending=False).reset_index()
+        curr_rank["curr_rank"] = range(1, len(curr_rank) + 1)
+        
+        prior_rank = prior_df.groupby("product_id")["revenue"].sum().sort_values(ascending=False).reset_index()
+        prior_rank["prior_rank"] = range(1, len(prior_rank) + 1)
+        
+        merged = curr_rank.merge(prior_rank[["product_id", "prior_rank"]], on="product_id", how="outer")
+        merged["curr_rank"] = merged["curr_rank"].fillna(len(merged) + 1).astype(int)
+        merged["prior_rank"] = merged["prior_rank"].fillna(len(merged) + 1).astype(int)
+        merged["rank_change"] = merged["prior_rank"] - merged["curr_rank"]  # positive = improved
+        
+        merged = merged.merge(prod_summary[["product_id", "product_description"]], on="product_id", how="left")
+        
+        # Top 15 by current revenue
+        top_15 = merged.nsmallest(15, "curr_rank")
+        
+        import matplotlib.pyplot as plt
+        fig, ax = plt.subplots(figsize=(10, 6))
+        
+        y_pos = np.arange(len(top_15))
+        ax.hlines(y_pos, top_15["prior_rank"], top_15["curr_rank"], color="#a0aec0", linewidth=2)
+        ax.plot(top_15["prior_rank"], y_pos, 'o', color="#a0aec0", markersize=8, label="Prior Rank")
+        ax.plot(top_15["curr_rank"], y_pos, 'o', color="#2b6cb0", markersize=8, label="Current Rank")
+        
+        # Add rank change labels
+        for i, (_, row) in enumerate(top_15.iterrows()):
+            change = row["rank_change"]
+            if change > 0:
+                color = "#2f855a"
+                label = f"▲ {change}"
+            elif change < 0:
+                color = "#e53e3e"
+                label = f"▼ {abs(change)}"
+            else:
+                color = "#718096"
+                label = "—"
+            ax.text(max(row["prior_rank"], row["curr_rank"]) + 0.5, i, label, 
+                   va='center', fontsize=10, fontweight='bold', color=color)
+            # Product name
+            ax.text(min(row["prior_rank"], row["curr_rank"]) - 0.5, i, 
+                   row["product_description"][:30], ha='right', va='center', fontsize=9)
+        
+        ax.set_yticks(y_pos)
+        ax.set_yticklabels([])
+        ax.set_xlabel("Revenue Rank", fontsize=10)
+        ax.set_title("Product Rank Change: Current vs Prior Period", fontsize=13, fontweight='bold', pad=15)
+        ax.legend(fontsize=9)
+        ax.invert_xaxis()  # Rank 1 on left
+        ax.spines['top'].set_visible(False)
+        ax.spines['right'].set_visible(False)
+        ax.grid(axis='x', alpha=0.3)
+        
+        plt.tight_layout()
+        return fig, ax
+    except Exception:
+        return None
+
+
+def _plot_top_product_trends(raw_df: pd.DataFrame, period_params: dict, prod_summary: pd.DataFrame, top_n: int = 8) -> tuple | None:
+    """Small multiples trend for top N products."""
+    try:
+        current_start = period_params["current_start"]
+        current_end = period_params["current_end"]
+        
+        # Wider window for trend
+        full_start = current_start - pd.Timedelta(days=180)
+        full_end = current_end
+        
+        df = raw_df[
+            (raw_df["transaction_day"] >= full_start) & 
+            (raw_df["transaction_day"] <= full_end)
+        ].copy()
+        
+        if df.empty:
+            return None
+        
+        df["revenue"] = df["quantity"] * df["price"]
+        
+        # Top N products by revenue in current period
+        curr_df = df[df["transaction_day"] >= current_start]
+        top_prods = curr_df.groupby("product_id")["revenue"].sum().nlargest(top_n).index
+        
+        # Determine granularity
+        period_days = (full_end - full_start).days
+        if period_days <= 60:
+            freq = "W-MON"
+        else:
+            freq = "M"
+        
+        df_top = df[df["product_id"].isin(top_prods)].copy()
+        df_top = df_top.merge(prod_summary[["product_id", "product_description"]], on="product_id", how="left")
+        
+        pivot = df_top.groupby([pd.Grouper(key="transaction_day", freq=freq), "product_description"])["revenue"].sum().unstack(fill_value=0)
+        
+        import matplotlib.pyplot as plt
+        n_cols = 4
+        n_rows = int(np.ceil(top_n / n_cols))
+        fig, axes = plt.subplots(n_rows, n_cols, figsize=(3*n_cols, 2.5*n_rows), sharey=True)
+        axes = axes.flatten() if top_n > 1 else [axes]
+        
+        colors = ["#2b6cb0", "#2f855a", "#dd6b20", "#6b46c1", "#975a16", "#d53f8c", "#4a5568", "#0987a0"]
+        
+        for i, (ax, prod) in enumerate(zip(axes, pivot.columns)):
+            if i >= top_n:
+                ax.set_visible(False)
+                continue
+            
+            color = colors[i % len(colors)]
+            ax.plot(pivot.index, pivot[prod].values, color=color, linewidth=2, marker='o', markersize=4)
+            ax.fill_between(pivot.index, pivot[prod].values, alpha=0.1, color=color)
+            
+            # Highlight current period
+            ax.axvspan(current_start, current_end, alpha=0.15, color='yellow')
+            
+            ax.set_title(prod[:25], fontsize=9, fontweight='bold')
+            ax.set_ylabel("Revenue", fontsize=8)
+            ax.spines['top'].set_visible(False)
+            ax.spines['right'].set_visible(False)
+            ax.grid(axis='y', alpha=0.3)
+            ax.tick_params(axis='x', rotation=30, labelsize=7)
+            ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, _: fmt_currency(x)))
+        
+        fig.suptitle(f"Top {top_n} Products: Revenue Trend", fontsize=13, fontweight='bold', y=1.02)
+        plt.tight_layout()
+        return fig, axes
+    except Exception:
+        return None
+
+
 def tab_rfm(R: dict[str, Any], raw_df: pd.DataFrame | None = None, period_params: dict | None = None) -> None:
-    """RFM Analysis tab with customer segmentation and quadrant scatter."""
+    """RFM Analysis tab with customer segmentation, value concentration, and action recommendations."""
     st.header("6 RFM Analysis")
-    st.caption("Question answered here: which customers are champions, at risk, or need attention?")
+    st.caption("Question answered here: which customers are champions, at risk, or need attention? How concentrated is revenue?")
     
     cf = table(R, "customer_features")
     if cf.empty:
@@ -1730,7 +2715,7 @@ def tab_rfm(R: dict[str, Any], raw_df: pd.DataFrame | None = None, period_params
             st.warning("RFM requires raw transaction data. Run analysis with raw data available.")
             return
     
-    # RFM Visualizations
+    # === RFM Segments Visualization ===
     st.subheader("RFM Segments")
     fig, axes = plot_rfm_segments(rfm)
     chart_card(fig, f"Identified {rfm['segment'].nunique()} RFM segments. Champions represent {rfm[rfm['segment']=='Champions']['monetary'].sum()/rfm['monetary'].sum()*100:.0f}% of revenue." if 'monetary' in rfm.columns else "RFM segmentation complete.")
@@ -1746,7 +2731,6 @@ def tab_rfm(R: dict[str, Any], raw_df: pd.DataFrame | None = None, period_params
         avg_monetary=("monetary", "mean") if "monetary" in rfm.columns else ("customer_id", "count"),
     ).sort_values("revenue", ascending=False).reset_index()
     
-    # Format for display
     display_cols = ["segment", "customers"]
     if "revenue" in seg_summary.columns:
         display_cols.append("revenue")
@@ -1754,6 +2738,66 @@ def tab_rfm(R: dict[str, Any], raw_df: pd.DataFrame | None = None, period_params
         display_cols.extend(["avg_recency", "avg_frequency", "avg_monetary"])
     
     show_df(pretty(seg_summary[display_cols]))
+    
+    # === Customer Value Concentration (Pareto & Lorenz) ===
+    if "monetary" in rfm.columns:
+        st.markdown("---")
+        st.subheader("Customer Value Concentration")
+        
+        col1, col2 = st.columns(2)
+        with col1:
+            st.markdown("**Pareto: Top Customers by Lifetime Revenue**")
+            pareto_fig = _plot_customer_pareto(rfm)
+            if pareto_fig:
+                chart_card(pareto_fig[0], "Shows how much revenue is concentrated in top customers. 80% threshold indicates Pareto principle.")
+        
+        with col2:
+            st.markdown("**Lorenz Curve: Revenue Inequality**")
+            lorenz_fig = _plot_customer_lorenz(rfm)
+            if lorenz_fig:
+                chart_card(lorenz_fig[0], "Area between curve and diagonal = revenue concentration. Gini coefficient quantifies inequality.")
+        
+        # Value tiers
+        st.markdown("---")
+        st.markdown("**Value Tier Breakdown**")
+        tiers_fig = _plot_customer_value_tiers(rfm)
+        if tiers_fig:
+            chart_card(tiers_fig[0], "Compares customer count share vs revenue share by value tier. Top 20% typically drive 60-80% of revenue.")
+        
+        # Concentration table
+        st.markdown("**Concentration Summary**")
+        n = len(rfm)
+        rfm_sorted = rfm.sort_values("monetary", ascending=False).reset_index(drop=True)
+        rfm_sorted["cum_revenue_pct"] = rfm_sorted["monetary"].cumsum() / rfm_sorted["monetary"].sum() * 100
+        rfm_sorted["cum_customer_pct"] = np.arange(1, n+1) / n * 100
+        
+        tiers = [
+            ("Top 1%", 0, 1),
+            ("Top 5%", 1, 5),
+            ("Top 10%", 5, 10),
+            ("Top 20%", 10, 20),
+            ("Middle 50%", 20, 70),
+            ("Bottom 30%", 70, 100),
+        ]
+        
+        tier_data = []
+        for label, pct_start, pct_end in tiers:
+            start_idx = int(n * pct_start / 100)
+            end_idx = int(n * pct_end / 100)
+            tier_customers = rfm_sorted.iloc[start_idx:end_idx]
+            if len(tier_customers) == 0:
+                continue
+            tier_data.append({
+                "Tier": label,
+                "Customers": len(tier_customers),
+                "Customer %": f"{len(tier_customers) / n * 100:.1f}%",
+                "Revenue": fmt_currency(tier_customers["monetary"].sum()),
+                "Revenue %": f"{tier_customers['monetary'].sum() / rfm['monetary'].sum() * 100:.1f}%",
+                "Avg Revenue/Cust": fmt_currency(tier_customers["monetary"].mean()),
+            })
+        
+        tier_df = pd.DataFrame(tier_data)
+        show_df(pretty(tier_df))
     
     # Action recommendations
     st.markdown("---")
@@ -1776,9 +2820,9 @@ def tab_rfm(R: dict[str, Any], raw_df: pd.DataFrame | None = None, period_params
 
 
 def tab_cohort(R: dict[str, Any], raw_df: pd.DataFrame | None = None, period_params: dict | None = None) -> None:
-    """Cohort Retention tab with heatmap and revenue analysis."""
+    """Cohort Retention tab with heatmap, retention metrics, and reactivation analysis."""
     st.header("7 Cohort Retention")
-    st.caption("Question answered here: do newer cohorts retain better? Which cohorts are most valuable?")
+    st.caption("Question answered here: do newer cohorts retain better? Which cohorts are most valuable? What's the repeat purchase rate?")
     
     # Use pre-computed cohort data from analysis
     cohort_data = table(R, "cohort_retention_new_customers")
@@ -1787,15 +2831,37 @@ def tab_cohort(R: dict[str, Any], raw_df: pd.DataFrame | None = None, period_par
         st.info("No cohort retention data available. Run analysis with sufficient history.")
         return
     
+    # === Cohort Retention Heatmap ===
     st.subheader("Cohort Retention Heatmap")
     fig, ax = plot_cohort_retention_heatmap(cohort_data)
     chart_card(fig, f"Tracking {len(cohort_data['cohort_month'].unique())} cohorts. Darker green = higher retention.")
+    
+    # === Retention & Loyalty Metrics ===
+    if raw_df is not None and period_params:
+        st.markdown("---")
+        st.subheader("Retention & Loyalty Metrics")
+        retention_metrics = _compute_retention_metrics(raw_df, period_params)
+        if retention_metrics:
+            fig, ax = _plot_retention_metrics(retention_metrics)
+            if fig:
+                chart_card(fig, f"Retention: {retention_metrics['retention_rate']*100:.1f}% | Reactivation: {retention_metrics['reactivation_rate']*100:.1f}% | Repeat Purchase Rate: {retention_metrics['repeat_purchase_rate']*100:.1f}%")
+            
+            # Key metrics in columns
+            col1, col2, col3, col4, col5 = st.columns(5)
+            col1.metric("Retention Rate", f"{retention_metrics['retention_rate']*100:.1f}%")
+            col2.metric("Reactivation Rate", f"{retention_metrics['reactivation_rate']*100:.1f}%")
+            col3.metric("Repeat Purchase Rate", f"{retention_metrics['repeat_purchase_rate']*100:.1f}%")
+            col4.metric("Repeat Revenue Share", f"{retention_metrics['repeat_revenue_share']*100:.1f}%")
+            col5.metric("New Customer Share", f"{retention_metrics['new_customer_share']*100:.1f}%")
+            
+            # Churned valuable customers
+            if retention_metrics.get('churned_valuable_count', 0) > 0:
+                st.warning(f"⚠️ **{retention_metrics['churned_valuable_count']} high-value customers (top 20%) have churned** - Lost historical revenue: {fmt_currency(retention_metrics['churned_valuable_revenue'])}")
     
     # Cohort size and revenue
     st.markdown("---")
     st.subheader("Cohort Size & Revenue")
     
-    # Get cohort sizes from customer_features
     cf = table(R, "customer_features")
     if not cf.empty and "observed_first_purchase_cohort_month" in cf.columns:
         cohort_sizes = cf.groupby("observed_first_purchase_cohort_month").agg(
@@ -1845,9 +2911,9 @@ def tab_cohort(R: dict[str, Any], raw_df: pd.DataFrame | None = None, period_par
 
 
 def tab_product_pareto(R: dict[str, Any], raw_df: pd.DataFrame | None = None, period_params: dict | None = None) -> None:
-    """Product Pareto Analysis tab."""
+    """Product Pareto Analysis tab with quadrant scatter, rank changes, and trends."""
     st.header("5 Products")
-    st.caption("Question answered here: which products drive revenue? Which are declining?")
+    st.caption("Question answered here: which products drive revenue? Which are declining? What's the portfolio structure?")
     
     # Product summary from analysis
     prod_summary = table(R, "product_summary")
@@ -1868,6 +2934,14 @@ def tab_product_pareto(R: dict[str, Any], raw_df: pd.DataFrame | None = None, pe
         st.subheader("Category Revenue Pareto")
         fig, _ = plot_pareto(cat_summary, "gross_purchase_revenue", "category", top_n=15, title="Top 15 Categories by Revenue")
         chart_card(fig, f"Top categories drive the majority of revenue.")
+    
+    # Product Portfolio Quadrant: Penetration vs Revenue per Order
+    if raw_df is not None and period_params:
+        st.markdown("---")
+        st.subheader("Product Portfolio: Penetration vs Revenue per Order")
+        quad_fig = _plot_product_quadrant(raw_df, period_params, prod_summary)
+        if quad_fig:
+            chart_card(quad_fig[0], "Quadrants: Traffic Drivers (high penetration, high rev/order), Premium Add-ons (low penetration, high rev/order), Volume Drivers (high penetration, low rev/order), Low Impact (low both).")
     
     # Product Movers - period over period
     if raw_df is not None and period_params:
@@ -1922,6 +2996,34 @@ def tab_product_pareto(R: dict[str, Any], raw_df: pd.DataFrame | None = None, pe
             st.markdown("**Top Decliners**")
             decliners = movers.nsmallest(10, "revenue_change")[["product_description", "revenue", "prior_revenue", "revenue_change", "pct_change"]]
             show_df(pretty(decliners))
+        
+        # Rank change chart
+        st.markdown("---")
+        st.subheader("Product Rank Change")
+        rank_fig = _plot_product_rank_change(raw_df, period_params, prod_summary)
+        if rank_fig:
+            chart_card(rank_fig[0], "Lines connect prior rank to current rank. Green = improved rank, Red = declined rank.")
+        
+        # Top product trends
+        st.markdown("---")
+        st.subheader("Top Product Revenue Trends")
+        trend_fig = _plot_top_product_trends(raw_df, period_params, prod_summary, top_n=8)
+        if trend_fig:
+            chart_card(trend_fig[0], f"Revenue trends for top products over last ~6 months. Yellow highlight = current period.")
+    
+    # Category Performance Analysis
+    if raw_df is not None and period_params:
+        st.markdown("---")
+        st.subheader("Category Performance: Growth vs Share")
+        cat_fig = _plot_category_contribution(raw_df, period_params)
+        if cat_fig:
+            chart_card(cat_fig[0], "Categories above the diagonal outperform total business growth. Bubble size = revenue.")
+        
+        st.markdown("---")
+        st.subheader("Category Revenue Mix Over Time")
+        mix_fig = _plot_category_mix_trend(raw_df, period_params)
+        if mix_fig:
+            chart_card(mix_fig[0], "Stacked area shows how category mix evolves. Yellow/blue highlights = current/prior period.")
     
     # Detailed tables
     st.markdown("---")
@@ -1930,11 +3032,6 @@ def tab_product_pareto(R: dict[str, Any], raw_df: pd.DataFrame | None = None, pe
         if len(t):
             with st.expander(title):
                 show_df(pretty(t.head(500)))
-
-
-# --------------------------------------------------------------------------- #
-# Main
-# --------------------------------------------------------------------------- #
 def landing() -> None:
     st.title("Customer Insight Lab")
     st.markdown("Turn line-item purchase data into a validated picture of your customers, using only the data you already have.")
