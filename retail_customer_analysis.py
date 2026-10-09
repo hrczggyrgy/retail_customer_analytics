@@ -230,6 +230,7 @@ def read_lazy_input(path: Path) -> pl.LazyFrame:
             infer_schema=False,
             null_values=["", "NULL", "null"],
             encoding="utf8-lossy",
+            schema_overrides={col: pl.String for col in COLUMNS},
         )
     if suffix in {".parquet", ".pq"}:
         return pl.scan_parquet(str(path))
@@ -244,7 +245,6 @@ def _date_parse_expression(date_format: str | None) -> pl.Expr:
         formats.append(date_format)
     formats.extend(
         [
-            "%+",
             "%Y-%m-%dT%H:%M:%S%.f",
             "%Y-%m-%d %H:%M:%S%.f",
             "%Y-%m-%dT%H:%M:%S",
@@ -1687,7 +1687,10 @@ def table_to_csv_compatible(frame: pl.DataFrame) -> pl.DataFrame:
     """Cast nested columns to strings for optional CSV output."""
     expressions: list[pl.Expr] = []
     for name, dtype in frame.schema.items():
-        if str(dtype).startswith(("List(", "Struct(", "Array(")):
+        dtype_str = str(dtype)
+        if dtype_str.startswith("List("):
+            expressions.append(pl.col(name).list.join(", ").alias(name))
+        elif dtype_str.startswith(("Struct(", "Array(")):
             expressions.append(pl.col(name).cast(pl.String).alias(name))
     return frame.with_columns(expressions) if expressions else frame
 
