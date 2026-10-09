@@ -528,13 +528,43 @@ def compute_rfm(df: pd.DataFrame, analysis_date: pd.Timestamp) -> pd.DataFrame:
     rfm["tenure_days"] = (rfm["last_purchase"] - rfm["first_purchase"]).dt.days
     rfm["aov"] = rfm["monetary"] / rfm["frequency"]
     
-    # RFM Scoring (quintiles 1-5, 5 is best)
+    # RFM Scoring (quintiles 1-5, 5 is best) - TIE-SAFE
+    # Use rank(method='average') then qcut to spread tied values across their percentile range
+    # This ensures identical values get identical scores while preserving discrimination
+    
+    def safe_qcut_score(series, q=5, reverse=False):
+        """Tie-safe quantile scoring using rank(method='average') + qcut.
+        
+        Tied values get the average rank, which places them in the middle of their percentile range.
+        Then qcut creates bins. This gives better discrimination than qcut on raw values
+        while maintaining tie-safety (identical values -> identical scores).
+        """
+        unique_vals = series.nunique()
+        if unique_vals < 2:
+            return pd.Series((q + 1) // 2, index=series.index, dtype=int)
+        
+        actual_q = min(q, unique_vals)
+        try:
+            # Rank with average method for ties (tied values get same average rank)
+            ranked = series.rank(method='average')
+            # qcut on ranks - this spreads tied values properly
+            bins = pd.qcut(ranked, q=actual_q, labels=False, duplicates='drop')
+            n_bins = bins.max() + 1
+            bins = bins + 1
+            
+            if reverse:
+                bins = n_bins + 1 - bins
+            
+            return bins.astype(int)
+        except ValueError:
+            return pd.Series((q + 1) // 2, index=series.index, dtype=int)
+    
     # Recency: lower is better -> reverse score
-    rfm["R_score"] = pd.qcut(rfm["recency_days"].rank(method="first"), 5, labels=[5,4,3,2,1]).astype(int)
+    rfm["R_score"] = safe_qcut_score(rfm["recency_days"], q=5, reverse=True)
     # Frequency: higher is better
-    rfm["F_score"] = pd.qcut(rfm["frequency"].rank(method="first"), 5, labels=[1,2,3,4,5]).astype(int)
+    rfm["F_score"] = safe_qcut_score(rfm["frequency"], q=5)
     # Monetary: higher is better
-    rfm["M_score"] = pd.qcut(rfm["monetary"].rank(method="first"), 5, labels=[1,2,3,4,5]).astype(int)
+    rfm["M_score"] = safe_qcut_score(rfm["monetary"], q=5)
     
     rfm["RFM_score"] = rfm["R_score"].astype(str) + rfm["F_score"].astype(str) + rfm["M_score"].astype(str)
     
