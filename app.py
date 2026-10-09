@@ -1373,7 +1373,7 @@ def tab_overview(R: dict[str, Any], raw_df: pd.DataFrame | None = None, period_p
         section("KPI Trends", "Recent trajectory across key metrics. Each sparkline shows the last 6 periods of the same length as your current selection.")
         sparkline_result = _plot_kpi_sparklines(raw_df, period_params)
         if sparkline_result:
-            chart_card(sparkline_result[0], "Track whether improvements are sustained or one-off. Consistent upward trends across Revenue, Orders, and Customers signal healthy growth.")
+            chart_card(sparkline_result[0], "Track whether improvements are sustained or one-off. Consistent upward trends across Revenue, Orders, and Customers signal healthy growth.", scope="Selected period length, last 6 periods · Positive purchases")
         
         # Revenue Waterfall Decomposition
         st.markdown("---")
@@ -1381,14 +1381,14 @@ def tab_overview(R: dict[str, Any], raw_df: pd.DataFrame | None = None, period_p
         waterfall_data = revenue_waterfall_data(current_metrics, prior_metrics)
         fig, _ = plot_revenue_waterfall(waterfall_data)
         pct_change = ((current_metrics['revenue'] / prior_metrics['revenue'] - 1) * 100) if prior_metrics['revenue'] > 0 else 0
-        chart_card(fig, f"Revenue changed by {fmt_currency(current_metrics['revenue'] - prior_metrics['revenue'])} ({fmt_pct(pct_change)}) vs comparison period.")
+        chart_card(fig, f"Revenue changed by {fmt_currency(current_metrics['revenue'] - prior_metrics['revenue'])} ({fmt_pct(pct_change)}) vs comparison period.", scope=f"Current: {ctx['current_start'].strftime('%Y-%m-%d')} to {ctx['current_end'].strftime('%Y-%m-%d')} · Prior: {ctx['prior_start'].strftime('%Y-%m-%d')} to {ctx['prior_end'].strftime('%Y-%m-%d')} · Positive purchases")
         
         # Category/Department Contribution to Revenue Change
         st.markdown("---")
         section("Category Contribution to Revenue Change", "Which categories drove growth or decline? Contribution = (category revenue change) / (total revenue change)")
         contrib_result = _plot_category_contribution_waterfall(raw_df, period_params)
         if contrib_result:
-            chart_card(contrib_result[0], "Categories with the largest bars (positive or negative) are where to focus assortment, pricing, or promotion reviews.")
+            chart_card(contrib_result[0], "Categories with the largest bars (positive or negative) are where to focus assortment, pricing, or promotion reviews.", scope=f"Current vs prior period · Category-level · Positive purchases")
         
         # Year-over-Year Trend Comparison
         st.markdown("---")
@@ -1409,13 +1409,13 @@ def tab_overview(R: dict[str, Any], raw_df: pd.DataFrame | None = None, period_p
         if anomaly_data and anomaly_data.get("anomalies"):
             summary_fig = _plot_anomaly_summary(anomaly_data)
             if summary_fig:
-                chart_card(summary_fig[0], "Anomaly counts and max deviations by metric in the current period.")
+                chart_card(summary_fig[0], "Anomaly counts and max deviations by metric in the current period.", scope=f"Current period: {anomaly_data.get('current_start', 'N/A')} to {anomaly_data.get('current_end', 'N/A')} · Rolling baseline: 28-day lagged ±2σ")
             
             # Show time series for metrics with anomalies
             for metric in anomaly_data["anomalies"].keys():
                 ts_fig = _plot_anomaly_timeseries(anomaly_data, metric)
                 if ts_fig:
-                    chart_card(ts_fig[0], f"{metric.replace('_', ' ').title()} with expected range and anomalies marked.")
+                    chart_card(ts_fig[0], f"{metric.replace('_', ' ').title()} with expected range and anomalies marked.", scope=f"Current period vs lagged rolling baseline (28-day, ±2σ) · Metric: {metric.replace('_', ' ').title()}")
         else:
             st.info("No anomalies detected in the current period.")
     
@@ -1949,7 +1949,7 @@ def tab_rfm(R: dict[str, Any], raw_df: pd.DataFrame | None = None, period_params
     # === RFM Segments Visualization ===
     st.subheader("RFM Segments")
     fig, axes = plot_rfm_segments(rfm)
-    chart_card(fig, f"Identified {rfm['segment'].nunique()} RFM segments. Champions represent {rfm[rfm['segment']=='Champions']['monetary'].sum()/rfm['monetary'].sum()*100:.0f}% of revenue." if 'monetary' in rfm.columns else "RFM segmentation complete.")
+    chart_card(fig, f"Identified {rfm['segment'].nunique()} RFM segments. Champions represent {rfm[rfm['segment']=='Champions']['monetary'].sum()/rfm['monetary'].sum()*100:.0f}% of revenue." if 'monetary' in rfm.columns else "RFM segmentation complete.", scope="As of analysis date · Recency/Frequency/Monetary quintiles · Tie-safe scoring")
     
     # Segment summary table
     st.markdown("---")
@@ -1980,20 +1980,20 @@ def tab_rfm(R: dict[str, Any], raw_df: pd.DataFrame | None = None, period_params
             st.markdown("**Pareto: Top Customers by Lifetime Revenue**")
             pareto_fig = _plot_customer_pareto(rfm)
             if pareto_fig:
-                chart_card(pareto_fig[0], "Shows how much revenue is concentrated in top customers. 80% threshold indicates Pareto principle.")
+                chart_card(pareto_fig[0], "Shows how much revenue is concentrated in top customers. 80% threshold indicates Pareto principle.", scope="Full observed history · Lifetime revenue (net_spend) · Exclusive tier labels")
         
         with col2:
             st.markdown("**Lorenz Curve: Revenue Inequality**")
             lorenz_fig = _plot_customer_lorenz(rfm)
             if lorenz_fig:
-                chart_card(lorenz_fig[0], "Area between curve and diagonal = revenue concentration. Gini coefficient quantifies inequality.")
+                chart_card(lorenz_fig[0], "Area between curve and diagonal = revenue concentration. Gini coefficient quantifies inequality.", scope="Full observed history · Lifetime revenue (net_spend) · Excludes non-positive monetary")
         
         # Value tiers
         st.markdown("---")
         st.markdown("**Value Tier Breakdown**")
         tiers_fig = _plot_customer_value_tiers(rfm)
         if tiers_fig:
-            chart_card(tiers_fig[0], "Compares customer count share vs revenue share by value tier. Top 20% typically drive 60-80% of revenue.")
+            chart_card(tiers_fig[0], "Compares customer count share vs revenue share by value tier (exclusive bands).", scope="Full observed history · Lifetime revenue (net_spend) · Exclusive bands: Top 1%, Next 4%, Next 5%, Next 10%, Middle 50%, Bottom 30%")
         
         # Concentration table
         st.markdown("**Concentration Summary**")
@@ -2109,17 +2109,17 @@ def tab_products(R: dict[str, Any], raw_df: pd.DataFrame | None = None, period_p
             # Top pairs by lift
             top_pairs_fig = _plot_basket_top_pairs(pairs, top_n=15)
             if top_pairs_fig:
-                chart_card(top_pairs_fig[0], "Top product pairs by lift. Lift > 1 = positive association.")
+                chart_card(top_pairs_fig[0], "Top product pairs by lift. Lift > 1 = positive association.", scope=f"Selected period · Product-level · Min support: {basket_data.get('min_support', 0.01):.1%} · Deduplicated per invoice")
             
             # Heatmap
             heatmap_fig = _plot_basket_heatmap(pairs, top_n=20)
             if heatmap_fig:
-                chart_card(heatmap_fig[0], "Lift matrix for top products. Red = positive association, Blue = negative.")
+                chart_card(heatmap_fig[0], "Lift matrix for top products. Red = positive association, Blue = negative.", scope=f"Selected period · Top products by lift sum · NaN = not computed (not independence)")
             
             # Network graph
             network_fig = _plot_basket_network(pairs, top_n=30)
             if network_fig:
-                chart_card(network_fig[0], "Product association network. Edge width = lift, Node size = connections.")
+                chart_card(network_fig[0], "Product association network. Edge width = lift, Node size = connections.", scope=f"Selected period · Top products by lift · Deduplicated per invoice")
     
     for stem, title in (("category_summary", "Category summary"), ("department_summary", "Department summary"), ("product_summary", "Product summary")):
         t = table(R, stem)
@@ -3848,7 +3848,7 @@ def _plot_drilldown_path(raw_df: pd.DataFrame, period_params: dict,
     # === RFM Segments Visualization ===
     st.subheader("RFM Segments")
     fig, axes = plot_rfm_segments(rfm)
-    chart_card(fig, f"Identified {rfm['segment'].nunique()} RFM segments. Champions represent {rfm[rfm['segment']=='Champions']['monetary'].sum()/rfm['monetary'].sum()*100:.0f}% of revenue." if 'monetary' in rfm.columns else "RFM segmentation complete.")
+    chart_card(fig, f"Identified {rfm['segment'].nunique()} RFM segments. Champions represent {rfm[rfm['segment']=='Champions']['monetary'].sum()/rfm['monetary'].sum()*100:.0f}% of revenue." if 'monetary' in rfm.columns else "RFM segmentation complete.", scope="As of analysis date · Recency/Frequency/Monetary quintiles · Tie-safe scoring")
     
     # Segment summary table
     st.markdown("---")
@@ -3879,20 +3879,20 @@ def _plot_drilldown_path(raw_df: pd.DataFrame, period_params: dict,
             st.markdown("**Pareto: Top Customers by Lifetime Revenue**")
             pareto_fig = _plot_customer_pareto(rfm)
             if pareto_fig:
-                chart_card(pareto_fig[0], "Shows how much revenue is concentrated in top customers. 80% threshold indicates Pareto principle.")
+                chart_card(pareto_fig[0], "Shows how much revenue is concentrated in top customers. 80% threshold indicates Pareto principle.", scope="Full observed history · Lifetime revenue (net_spend) · Exclusive tier labels")
         
         with col2:
             st.markdown("**Lorenz Curve: Revenue Inequality**")
             lorenz_fig = _plot_customer_lorenz(rfm)
             if lorenz_fig:
-                chart_card(lorenz_fig[0], "Area between curve and diagonal = revenue concentration. Gini coefficient quantifies inequality.")
+                chart_card(lorenz_fig[0], "Area between curve and diagonal = revenue concentration. Gini coefficient quantifies inequality.", scope="Full observed history · Lifetime revenue (net_spend) · Excludes non-positive monetary")
         
         # Value tiers
         st.markdown("---")
         st.markdown("**Value Tier Breakdown**")
         tiers_fig = _plot_customer_value_tiers(rfm)
         if tiers_fig:
-            chart_card(tiers_fig[0], "Compares customer count share vs revenue share by value tier. Top 20% typically drive 60-80% of revenue.")
+            chart_card(tiers_fig[0], "Compares customer count share vs revenue share by value tier (exclusive bands).", scope="Full observed history · Lifetime revenue (net_spend) · Exclusive bands: Top 1%, Next 4%, Next 5%, Next 10%, Middle 50%, Bottom 30%")
         
         # Concentration table
         st.markdown("**Concentration Summary**")
@@ -4076,7 +4076,7 @@ def tab_product_pareto(R: dict[str, Any], raw_df: pd.DataFrame | None = None, pe
     # Product Pareto
     st.subheader("Product Revenue Pareto")
     fig, _ = plot_pareto(prod_summary, "gross_purchase_revenue", label_col, top_n=20, title="Top 20 Products by Revenue")
-    chart_card(fig, f"Top 20 products account for {prod_summary.nlargest(20, 'gross_purchase_revenue')['gross_purchase_revenue'].sum() / prod_summary['gross_purchase_revenue'].sum() * 100:.1f}% of revenue.")
+    chart_card(fig, f"Top 20 products account for {prod_summary.nlargest(20, 'gross_purchase_revenue')['gross_purchase_revenue'].sum() / prod_summary['gross_purchase_revenue'].sum() * 100:.1f}% of revenue.", scope="Full observed history · Gross purchase revenue (positive qty only)")
     
     # Category Pareto
     if not cat_summary.empty:
@@ -4099,7 +4099,7 @@ def tab_product_pareto(R: dict[str, Any], raw_df: pd.DataFrame | None = None, pe
         st.subheader("Category Performance: Growth vs Share")
         cat_fig = _plot_category_contribution(raw_df, period_params)
         if cat_fig:
-            chart_card(cat_fig[0], "X=Revenue Growth %, Y=Revenue Share %. Top-right=Scale Drivers, Top-left=Emerging Stars, Bottom-right=Declining Priorities, Bottom-left=Small Declines. Vertical line=Total Business Growth.")
+            chart_card(cat_fig[0], "X=Revenue Growth %, Y=Revenue Share %. Top-right=Scale Drivers, Top-left=Emerging Stars, Bottom-right=Declining Priorities, Bottom-left=Small Declines. Vertical line=Total Business Growth.", scope=f"Current vs prior period · Category-level · Positive purchases")
     
     # Product Movers - period over period
     if raw_df is not None and period_params:
@@ -4165,14 +4165,14 @@ def tab_product_pareto(R: dict[str, Any], raw_df: pd.DataFrame | None = None, pe
         st.subheader("Product Rank Change")
         rank_fig = _plot_product_rank_change(raw_df, period_params, prod_summary)
         if rank_fig:
-            chart_card(rank_fig[0], "Lines connect prior rank to current rank. Green = improved rank, Red = declined rank.")
+            chart_card(rank_fig[0], "Lines connect prior rank to current rank. Green = improved rank, Red = declined rank.", scope=f"Current vs prior period · Product-level revenue rank")
         
         # Top product trends
         st.markdown("---")
         st.subheader("Top Product Revenue Trends")
         trend_fig = _plot_top_product_trends(raw_df, period_params, prod_summary, top_n=8)
         if trend_fig:
-            chart_card(trend_fig[0], f"Revenue trends for top products over last ~6 months. Yellow highlight = current period.")
+            chart_card(trend_fig[0], f"Revenue trends for top products over last ~6 months. Yellow highlight = current period.", scope=f"Last ~6 months · Top products by current revenue · Positive purchases")
     
     # Category Performance Analysis
     if raw_df is not None and period_params:
@@ -4180,13 +4180,13 @@ def tab_product_pareto(R: dict[str, Any], raw_df: pd.DataFrame | None = None, pe
         st.subheader("Category Performance: Growth vs Share")
         cat_fig = _plot_category_contribution(raw_df, period_params)
         if cat_fig:
-            chart_card(cat_fig[0], "Categories above the diagonal outperform total business growth. Bubble size = revenue.")
+            chart_card(cat_fig[0], "Categories above the diagonal outperform total business growth. Bubble size = revenue.", scope=f"Current vs prior period · Category-level · Positive purchases")
         
         st.markdown("---")
         st.subheader("Category Revenue Mix Over Time")
         mix_fig = _plot_category_mix_trend(raw_df, period_params)
         if mix_fig:
-            chart_card(mix_fig[0], "Stacked area shows how category mix evolves. Yellow/blue highlights = current/prior period.")
+            chart_card(mix_fig[0], "Stacked area shows how category mix evolves. Yellow/blue highlights = current/prior period.", scope=f"Last ~6 months · Top 6 categories + Other · Current/prior period highlights")
     
     # Detailed tables
     st.markdown("---")
