@@ -70,8 +70,17 @@ def section(title: str, question: str = "") -> None:
     if question:
         st.caption(question)
 
-def chart_card(fig, takeaway: str, *, key: str = "") -> None:
-    """Render a matplotlib figure with a takeaway caption and close the figure."""
+def chart_card(fig, takeaway: str, *, key: str = "", scope: str = "") -> None:
+    """Render a matplotlib figure with a takeaway caption and close the figure.
+    
+    Args:
+        fig: matplotlib figure
+        takeaway: markdown caption explaining the chart
+        key: optional key for tracking
+        scope: optional scope label (e.g., "Selected period · Positive purchases")
+    """
+    if scope:
+        st.caption(f"📊 Scope: {scope}")
     st.pyplot(fig, use_container_width=True, clear_figure=True)
     if takeaway:
         st.markdown(f"*{takeaway}*")
@@ -1392,6 +1401,23 @@ def tab_overview(R: dict[str, Any], raw_df: pd.DataFrame | None = None, period_p
         st.markdown("---")
         section("Executive Summary", "Automated narrative synthesizing the key drivers.")
         _render_executive_narrative(current_metrics, prior_metrics, period_params)
+        
+        # Anomaly Detection
+        st.markdown("---")
+        section("Anomaly Detection", "Statistical exceptions in daily KPIs vs. lagged rolling baseline (±2σ).")
+        anomaly_data = _compute_anomalies(raw_df, period_params)
+        if anomaly_data and anomaly_data.get("anomalies"):
+            summary_fig = _plot_anomaly_summary(anomaly_data)
+            if summary_fig:
+                chart_card(summary_fig[0], "Anomaly counts and max deviations by metric in the current period.")
+            
+            # Show time series for metrics with anomalies
+            for metric in anomaly_data["anomalies"].keys():
+                ts_fig = _plot_anomaly_timeseries(anomaly_data, metric)
+                if ts_fig:
+                    chart_card(ts_fig[0], f"{metric.replace('_', ' ').title()} with expected range and anomalies marked.")
+        else:
+            st.info("No anomalies detected in the current period.")
     
     else:
         # Fallback to simple KPIs
@@ -2068,6 +2094,33 @@ def tab_products(R: dict[str, Any], raw_df: pd.DataFrame | None = None, period_p
     # Basket rules lift matrix
     show_charts(R, ["12_basket_rules", "13_next_trip"])
     
+    # Period-based Basket Analysis (selected period)
+    if raw_df is not None and period_params:
+        st.markdown("---")
+        st.subheader("Product Cross-sell (Selected Period)")
+        basket_data = _compute_basket_analysis(raw_df, period_params)
+        pairs = basket_data.get("pairs", pd.DataFrame())
+        
+        if pairs.empty:
+            st.info("No product pairs meet the current support threshold in the selected period.")
+        else:
+            st.caption(f"{len(pairs):,} product pairs found with min support {basket_data.get('min_support', 0.01):.1%}.")
+            
+            # Top pairs by lift
+            top_pairs_fig = _plot_basket_top_pairs(pairs, top_n=15)
+            if top_pairs_fig:
+                chart_card(top_pairs_fig[0], "Top product pairs by lift. Lift > 1 = positive association.")
+            
+            # Heatmap
+            heatmap_fig = _plot_basket_heatmap(pairs, top_n=20)
+            if heatmap_fig:
+                chart_card(heatmap_fig[0], "Lift matrix for top products. Red = positive association, Blue = negative.")
+            
+            # Network graph
+            network_fig = _plot_basket_network(pairs, top_n=30)
+            if network_fig:
+                chart_card(network_fig[0], "Product association network. Edge width = lift, Node size = connections.")
+    
     for stem, title in (("category_summary", "Category summary"), ("department_summary", "Department summary"), ("product_summary", "Product summary")):
         t = table(R, stem)
         if len(t):
@@ -2146,6 +2199,18 @@ def tab_explorer(R: dict[str, Any], raw_df: pd.DataFrame | None = None, period_p
             ax.set_title(f"{y_metric} distribution by segment")
             chart_card(fig, f"Segment {max(groups, key=lambda g: cf[cf['cluster_label']==g][y_metric].median())} has highest median {y_metric}")
     
+    # Drill-down: Period comparison by dimension
+    if raw_df is not None and period_params:
+        st.markdown("---")
+        st.subheader("Drill-down: Period Comparison by Dimension")
+        drill_dim = st.selectbox("Dimension", cat_cols, index=cat_cols.index("category") if "category" in cat_cols else 0)
+        drill_metric = st.selectbox("Metric", ["revenue", "orders", "customers", "aov", "units_per_order"], 
+                                     index=numeric_cols.index("revenue") if "revenue" in numeric_cols else 0)
+        
+        drill_fig = _plot_drilldown_path(raw_df, period_params, drill_dim, drill_metric, top_n=15)
+        if drill_fig:
+            chart_card(drill_fig[0], f"{drill_metric.replace('_', ' ').title()} by {drill_dim} for current vs prior period.")
+    
     st.markdown("---")
     
     # Segment comparison
@@ -2199,6 +2264,33 @@ def tab_explorer(R: dict[str, Any], raw_df: pd.DataFrame | None = None, period_p
             st.warning("No customer with that id in the scored table.")
         else:
             show_df(hit.T.reset_index().rename(columns={"index": "field", hit.index[0]: "value"}).astype(str))
+    
+    # Prioritized Action Matrix
+    st.markdown("---")
+    st.header("🎯 Prioritized Action Matrix")
+    st.caption("Actions derived from RFM, basket analysis, anomaly detection, and retention metrics.")
+    
+    if raw_df is not None and period_params:
+        with st.spinner("Computing action priorities..."):
+            # Compute basket and anomaly data
+            basket_data = _compute_basket_analysis(raw_df, period_params)
+            anomaly_data = _compute_anomalies(raw_df, period_params)
+            
+            # Prepare RFM data from customer_features
+            rfm_for_actions = cf.copy()
+            if "rfm_segment" in cf.columns:
+                rfm_for_actions["segment"] = cf["rfm_segment"]
+                if "net_spend" in cf.columns:
+                    rfm_for_actions["monetary"] = cf["net_spend"]
+            
+            # Get retention metrics
+            retention_metrics = _compute_retention_metrics(raw_df, period_params)
+            
+            # Generate and render actions
+            actions = _generate_action_matrix(rfm_for_actions, basket_data, anomaly_data, {}, retention_metrics)
+            _render_action_matrix(actions)
+    else:
+        st.info("Action matrix requires raw transaction data and period selection.")
 
 
 def tab_data(R: dict[str, Any], raw_df: pd.DataFrame | None = None, period_params: dict | None = None) -> None:
@@ -3279,6 +3371,11 @@ def _compute_anomalies(raw_df: pd.DataFrame, period_params: dict, window_days: i
             upper = rolling_mean + k * rolling_std
             lower = rolling_mean - k * rolling_std
             
+            # Store metric-specific bands for plotting
+            daily[f"{metric}_expected"] = rolling_mean
+            daily[f"{metric}_upper"] = upper
+            daily[f"{metric}_lower"] = lower
+            
             # Flag anomalies in current period
             curr_mask = (daily["transaction_day"] >= current_start) & (daily["transaction_day"] <= current_end)
             curr_data = daily[curr_mask].copy()
@@ -3306,11 +3403,6 @@ def _compute_anomalies(raw_df: pd.DataFrame, period_params: dict, window_days: i
             if metric_anomalies:
                 anomalies[metric] = metric_anomalies
         
-        # Store rolling stats for plotting
-        daily["expected"] = rolling_mean
-        daily["upper"] = upper
-        daily["lower"] = lower
-        
         return {"daily": daily, "anomalies": anomalies, "current_start": current_start, "current_end": current_end}
     except Exception:
         return {}
@@ -3333,11 +3425,14 @@ def _plot_anomaly_timeseries(anomaly_data: dict, metric: str) -> tuple | None:
         # Plot all data
         ax.plot(daily["transaction_day"], daily[metric], color="#1a202c", linewidth=1.5, label="Actual", alpha=0.7)
         
-        # Plot expected band if available
-        if "expected" in daily.columns and "upper" in daily.columns and "lower" in daily.columns:
-            ax.fill_between(daily["transaction_day"], daily["lower"], daily["upper"], 
+        # Plot expected band if available (metric-specific columns)
+        exp_col = f"{metric}_expected"
+        upper_col = f"{metric}_upper"
+        lower_col = f"{metric}_lower"
+        if exp_col in daily.columns and upper_col in daily.columns and lower_col in daily.columns:
+            ax.fill_between(daily["transaction_day"], daily[lower_col], daily[upper_col], 
                            alpha=0.2, color='#2b6cb0', label='Expected Range (±2σ)')
-            ax.plot(daily["transaction_day"], daily["expected"], color="#2b6cb0", linewidth=1, linestyle='--', label="Expected", alpha=0.7)
+            ax.plot(daily["transaction_day"], daily[exp_col], color="#2b6cb0", linewidth=1, linestyle='--', label="Expected", alpha=0.7)
         
         # Highlight current period
         if current_start and current_end:
@@ -4079,6 +4174,18 @@ def main() -> None:
     st.caption(f"Showing results for: {st.session_state.get('source_label', 'data')}  |  {R['rows']:,} rows")
     
     # Wrapper functions for consolidated tabs
+    def tab_customers_and_rfm(R, raw_df, period_params):
+        """Combined Customers & RFM tab."""
+        tab_customers(R, raw_df, period_params)
+        st.markdown("---")
+        tab_rfm(R, raw_df, period_params)
+    
+    def tab_retention_and_behaviour(R, raw_df, period_params):
+        """Combined Retention & Behaviour tab."""
+        tab_behaviour(R, raw_df, period_params)
+        st.markdown("---")
+        tab_cohort(R, raw_df, period_params)
+    
     def tab_products_and_baskets(R, raw_df, period_params):
         """Combined Products & Baskets tab."""
         tab_product_pareto(R, raw_df, period_params)
@@ -4096,7 +4203,7 @@ def main() -> None:
     
     # Updated tabs with new sections (6 tabs)
     tabs = st.tabs(TABS)
-    tab_functions = [tab_overview, tab_trust, tab_customers, tab_behaviour, tab_products_and_baskets, tab_explorer_and_data]
+    tab_functions = [tab_overview, tab_trust, tab_customers_and_rfm, tab_retention_and_behaviour, tab_products_and_baskets, tab_explorer_and_data]
     for tab, fn in zip(tabs, tab_functions):
         with tab:
             fn(R, raw_df, period_params)
