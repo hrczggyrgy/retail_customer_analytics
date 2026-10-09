@@ -1,6 +1,7 @@
 # Test data and output directories
 test_data*/
 test_output*/
+sample_data.csv
 
 # Python
 __pycache__/
