@@ -45,7 +45,7 @@ if str(APP_DIR) not in sys.path:
 REQUIRED = ["customer_id", "transaction_date", "transaction_id", "product_id", "product_description",
             "department", "category", "price", "quantity"]
 
-TABS = ["1 Overview", "2 Can we trust it?", "3 Customers", "4 Behaviour", "5 Products and baskets", "6 Customer explorer", "7 Data and downloads"]
+TABS = ["1 Overview", "2 Trust", "3 Customers", "4 Behaviour", "5 Products", "6 RFM Analysis", "7 Cohort Retention", "8 Explorer", "9 Data"]
 CHARTS_BY_TAB = {
     "trust": ["01_model_validation", "02_calibration", "05_cluster_selection"],
     "customers": ["03_customer_map", "04_segment_value", "06_rfm_segments", "09_revenue_concentration", "18_lorenz_segments", "19_action_quadrant"],
@@ -129,6 +129,602 @@ SEGMENT_COLORS = {
 def segment_color(label: str) -> str:
     """Get consistent colour for a segment label."""
     return SEGMENT_COLORS.get(str(label), "#4a5568")
+
+# ============================================================
+# Executive Overview Helpers - Phase 1 & 2
+# ============================================================
+def kpi_tile_row(metrics: list[dict]) -> None:
+    """Render a row of executive KPI tiles with current, prior, change, pct_change.
+    
+    metrics: list of dicts with keys:
+        - label: metric name
+        - current: current period value (formatted string)
+        - prior: comparison period value (formatted string)  
+        - change: absolute change (formatted string)
+        - pct_change: percentage change (formatted string, e.g. "+5.2%")
+        - trend: "up" | "down" | "neutral" for color coding
+        - help_text: optional tooltip
+    """
+    if not metrics:
+        return
+    
+    n = len(metrics)
+    cols = st.columns(n)
+    
+    for col, m in zip(cols, metrics):
+        delta_color = "normal"
+        if m.get("trend") == "up":
+            delta_color = "normal"
+        elif m.get("trend") == "down":
+            delta_color = "inverse"
+            
+        col.metric(
+            label=m["label"],
+            value=m["current"],
+            delta=f"{m['change']} ({m['pct_change']})" if m.get("change") else None,
+            delta_color=delta_color,
+            help=m.get("help_text", "")
+        )
+
+def period_selector_sidebar(df: pd.DataFrame) -> tuple[pd.Timestamp, pd.Timestamp, str]:
+    """Global period selector in sidebar. Returns (current_start, current_end, compare_mode).
+    
+    compare_mode: "prior" | "yoy" | "custom"
+    """
+    if df.empty or "transaction_day" not in df.columns:
+        return None, None, "prior"
+    
+    min_date = df["transaction_day"].min()
+    max_date = df["transaction_day"].max()
+    
+    with st.sidebar.expander("📅 Period Selection", expanded=True):
+        # Preset options
+        preset = st.selectbox(
+            "Current period",
+            ["Last 7 days", "Last 28 days", "Last 90 days", "Month to date", "Quarter to date", "Custom range"],
+            index=1
+        )
+        
+        if preset == "Last 7 days":
+            current_end = max_date
+            current_start = current_end - pd.Timedelta(days=6)
+        elif preset == "Last 28 days":
+            current_end = max_date
+            current_start = current_end - pd.Timedelta(days=27)
+        elif preset == "Last 90 days":
+            current_end = max_date
+            current_start = current_end - pd.Timedelta(days=89)
+        elif preset == "Month to date":
+            current_end = max_date
+            current_start = current_end.replace(day=1)
+        elif preset == "Quarter to date":
+            current_end = max_date
+            quarter_start_month = ((current_end.month - 1) // 3) * 3 + 1
+            current_start = current_end.replace(month=quarter_start_month, day=1)
+        else:  # Custom range
+            date_range = st.date_input(
+                "Custom date range",
+                value=(max_date - pd.Timedelta(days=27), max_date),
+                min_value=min_date,
+                max_value=max_date,
+            )
+            if len(date_range) == 2:
+                current_start = pd.Timestamp(date_range[0])
+                current_end = pd.Timestamp(date_range[1])
+            else:
+                current_start = max_date - pd.Timedelta(days=27)
+                current_end = max_date
+        
+        st.caption(f"Current: {current_start.strftime('%Y-%m-%d')} to {current_end.strftime('%Y-%m-%d')}")
+        
+        # Comparison period
+        compare_mode = st.selectbox(
+            "Compare to",
+            ["Prior period (equal length)", "Same period last year", "Custom comparison"],
+            index=0
+        )
+        
+        if compare_mode == "Custom comparison":
+            comp_range = st.date_input(
+                "Comparison date range",
+                value=(current_start - pd.Timedelta(days=(current_end - current_start).days + 1), 
+                       current_start - pd.Timedelta(days=1)),
+                min_value=min_date,
+                max_value=max_date,
+            )
+            if len(comp_range) == 2:
+                st.session_state["custom_compare_start"] = pd.Timestamp(comp_range[0])
+                st.session_state["custom_compare_end"] = pd.Timestamp(comp_range[1])
+            compare_mode = "custom"
+        else:
+            compare_mode = "prior" if compare_mode == "Prior period (equal length)" else "yoy"
+    
+    return current_start, current_end, compare_mode
+
+def compute_period_metrics(df: pd.DataFrame, start: pd.Timestamp, end: pd.Timestamp) -> dict:
+    """Compute all executive KPIs for a given period."""
+    period_df = df[
+        (df["transaction_day"] >= start) & 
+        (df["transaction_day"] <= end)
+    ].copy()
+    
+    if period_df.empty:
+        return {
+            "revenue": 0, "orders": 0, "customers": 0, "aov": 0,
+            "units_per_order": 0, "avg_unit_price": 0,
+            "revenue_per_customer": 0, "orders_per_customer": 0,
+            "units_sold": 0
+        }
+    
+    period_df["revenue"] = period_df["quantity"] * period_df["price"]
+    
+    revenue = period_df["revenue"].sum()
+    orders = period_df["transaction_id"].nunique()
+    customers = period_df["customer_id"].nunique()
+    units_sold = period_df["quantity"].sum()
+    
+    aov = revenue / orders if orders > 0 else 0
+    units_per_order = units_sold / orders if orders > 0 else 0
+    avg_unit_price = revenue / units_sold if units_sold > 0 else 0
+    revenue_per_customer = revenue / customers if customers > 0 else 0
+    orders_per_customer = orders / customers if customers > 0 else 0
+    
+    return {
+        "revenue": revenue,
+        "orders": int(orders),
+        "customers": int(customers),
+        "aov": aov,
+        "units_per_order": units_per_order,
+        "avg_unit_price": avg_unit_price,
+        "revenue_per_customer": revenue_per_customer,
+        "orders_per_customer": orders_per_customer,
+        "units_sold": int(units_sold),
+    }
+
+def fmt_currency(v: float) -> str:
+    if v >= 1e9:
+        return f"${v/1e9:.1f}B"
+    elif v >= 1e6:
+        return f"${v/1e6:.1f}M"
+    elif v >= 1e3:
+        return f"${v/1e3:.1f}K"
+    else:
+        return f"${v:,.0f}"
+
+def fmt_number(v: float) -> str:
+    if v >= 1e6:
+        return f"{v/1e6:.1f}M"
+    elif v >= 1e3:
+        return f"{v/1e3:.1f}K"
+    else:
+        return f"{v:,.0f}"
+
+def fmt_pct(v: float) -> str:
+    sign = "+" if v >= 0 else ""
+    return f"{sign}{v:.1f}%"
+
+def revenue_waterfall_data(current: dict, prior: dict) -> list[dict]:
+    """Compute revenue waterfall decomposition.
+    
+    Revenue = Customers × Orders/Customer × AOV
+    AOV = Units/Order × Avg Unit Price
+    """
+    # Base components
+    c_cust = current["customers"]
+    c_freq = current["orders_per_customer"]
+    c_aov = current["aov"]
+    c_upo = current["units_per_order"]
+    c_aup = current["avg_unit_price"]
+    
+    p_cust = prior["customers"]
+    p_freq = prior["orders_per_customer"]
+    p_aov = prior["aov"]
+    p_upo = prior["units_per_order"]
+    p_aup = prior["avg_unit_price"]
+    
+    # Revenue totals
+    rev_current = current["revenue"]
+    rev_prior = prior["revenue"]
+    
+    # Decomposition: change each driver while holding others at prior levels
+    # Customer count effect
+    cust_effect = (c_cust - p_cust) * p_freq * p_aov
+    # Frequency effect (orders per customer)
+    freq_effect = c_cust * (c_freq - p_freq) * p_aov
+    # AOV effect
+    aov_effect = c_cust * c_freq * (c_aov - p_aov)
+    
+    # AOV sub-decomposition
+    upo_effect = c_cust * c_freq * (c_upo - p_upo) * p_aup
+    aup_effect = c_cust * c_freq * c_upo * (c_aup - p_aup)
+    
+    # Residual (interaction effects)
+    total_decomposed = cust_effect + freq_effect + aov_effect
+    residual = (rev_current - rev_prior) - total_decomposed
+    
+    return [
+        {"label": "Prior Period Revenue", "value": rev_prior, "type": "total"},
+        {"label": "Customer Count", "value": cust_effect, "type": "driver"},
+        {"label": "Purchase Frequency", "value": freq_effect, "type": "driver"},
+        {"label": "Units per Order", "value": upo_effect, "type": "subdriver"},
+        {"label": "Avg Unit Price", "value": aup_effect, "type": "subdriver"},
+        {"label": "Current Period Revenue", "value": rev_current, "type": "total"},
+    ]
+
+def plot_revenue_waterfall(waterfall_data: list[dict], currency_fmt: callable = fmt_currency) -> tuple:
+    """Create matplotlib waterfall chart for revenue decomposition."""
+    import matplotlib.pyplot as plt
+    import matplotlib.patches as mpatches
+    
+    fig, ax = plt.subplots(figsize=(12, 5))
+    
+    labels = [d["label"] for d in waterfall_data]
+    values = [d["value"] for d in waterfall_data]
+    types = [d["type"] for d in waterfall_data]
+    
+    # Calculate running totals for bar positions
+    running = 0
+    bar_bottoms = []
+    bar_heights = []
+    
+    for i, (v, t) in enumerate(zip(values, types)):
+        if t == "total":
+            if i == 0:  # First total (prior)
+                bar_bottoms.append(0)
+                bar_heights.append(v)
+                running = v
+            else:  # Last total (current)
+                bar_bottoms.append(0)
+                bar_heights.append(v)
+        elif t == "driver":
+            bar_bottoms.append(running)
+            bar_heights.append(v)
+            running += v
+        elif t == "subdriver":
+            bar_bottoms.append(running)
+            bar_heights.append(v)
+            running += v
+    
+    # Colors
+    colors = []
+    for t in types:
+        if t == "total":
+            colors.append("#1a365d")  # Dark blue
+        elif t == "driver":
+            colors.append("#2b6cb0" if bar_heights[colors.__len__()] >= 0 else "#e53e3e")
+        else:  # subdriver
+            colors.append("#4299e1" if bar_heights[colors.__len__()] >= 0 else "#fc8181")
+    
+    x_pos = range(len(labels))
+    bars = ax.bar(x_pos, bar_heights, bottom=bar_bottoms, color=colors, edgecolor="white", linewidth=0.5, width=0.6)
+    
+    # Add value labels on bars
+    for i, (bar, v, t) in enumerate(zip(bars, values, types)):
+        height = bar.get_height()
+        bottom = bar.get_y()
+        center = bottom + height / 2
+        
+        if t == "total":
+            label = currency_fmt(v)
+            ax.text(bar.get_x() + bar.get_width()/2, bottom + height + max(abs(v) for v in values)*0.02,
+                   label, ha='center', va='bottom', fontweight='bold', fontsize=10)
+        else:
+            label = f"{'+' if v >= 0 else ''}{currency_fmt(v)}"
+            color = 'black' if abs(height) > max(abs(v) for v in values)*0.1 else 'white'
+            ax.text(bar.get_x() + bar.get_width()/2, center, label, 
+                   ha='center', va='center', fontsize=9, fontweight='medium', color=color)
+    
+    # Connecting lines between bars
+    for i in range(len(bars) - 1):
+        if types[i] != "total" and types[i+1] != "total":
+            x1 = bars[i].get_x() + bars[i].get_width()
+            y1 = bars[i].get_y() + bars[i].get_height()
+            x2 = bars[i+1].get_x()
+            y2 = bars[i+1].get_y()
+            ax.plot([x1, x2], [y1, y2], 'k--', alpha=0.3, linewidth=0.5)
+    
+    ax.set_xticks(x_pos)
+    ax.set_xticklabels(labels, rotation=15, ha='right', fontsize=10)
+    ax.set_ylabel("Revenue", fontsize=11)
+    ax.set_title("Revenue Change Decomposition: What Drove the Change?", fontsize=13, fontweight='bold', pad=15)
+    ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, _: currency_fmt(x)))
+    ax.axhline(y=0, color='gray', linewidth=0.5)
+    ax.spines['top'].set_visible(False)
+    ax.spines['right'].set_visible(False)
+    ax.grid(axis='y', alpha=0.3)
+    
+    plt.tight_layout()
+    return fig, ax
+
+def plot_kpi_sparklines(periods: list[str], values: list[list], labels: list[str], colors: list[str] = None) -> tuple:
+    """Create small multiples sparkline chart for KPI trends."""
+    import matplotlib.pyplot as plt
+    
+    n = len(values)
+    if colors is None:
+        colors = ["#2b6cb0", "#2f855a", "#dd6b20", "#6b46c1", "#975a16", "#d53f8c"]
+    
+    fig, axes = plt.subplots(1, n, figsize=(3*n, 2.5), sharex=True)
+    if n == 1:
+        axes = [axes]
+    
+    for i, (ax, vals, label) in enumerate(zip(axes, values, labels)):
+        color = colors[i % len(colors)]
+        ax.plot(range(len(vals)), vals, color=color, linewidth=2, marker='o', markersize=4)
+        ax.fill_between(range(len(vals)), vals, alpha=0.1, color=color)
+        ax.set_title(label, fontsize=10, fontweight='bold')
+        ax.set_xticks(range(len(periods)))
+        ax.set_xticklabels(periods, rotation=30, ha='right', fontsize=8)
+        ax.spines['top'].set_visible(False)
+        ax.spines['right'].set_visible(False)
+        ax.grid(axis='y', alpha=0.3)
+        
+        # Highlight last point
+        ax.plot(len(vals)-1, vals[-1], 'o', color=color, markersize=8, markerfacecolor='white', markeredgewidth=2)
+        
+        # Add value label for last point
+        ax.annotate(f"{vals[-1]:,.0f}", 
+                   xy=(len(vals)-1, vals[-1]),
+                   xytext=(5, 5), textcoords='offset points',
+                   fontsize=9, fontweight='bold', color=color)
+    
+    plt.tight_layout()
+    return fig, axes
+
+def compute_rfm(df: pd.DataFrame, analysis_date: pd.Timestamp) -> pd.DataFrame:
+    """Compute RFM metrics for each customer as of analysis_date."""
+    # Filter to analysis date
+    df = df[df["transaction_day"] <= analysis_date].copy()
+    df["revenue"] = df["quantity"] * df["price"]
+    
+    # Customer-level aggregation
+    rfm = df.groupby("customer_id").agg(
+        last_purchase=("transaction_day", "max"),
+        first_purchase=("transaction_day", "min"),
+        frequency=("transaction_id", "nunique"),
+        monetary=("revenue", "sum"),
+        total_quantity=("quantity", "sum"),
+    ).reset_index()
+    
+    # Recency in days
+    rfm["recency_days"] = (analysis_date - rfm["last_purchase"]).dt.days
+    rfm["tenure_days"] = (rfm["last_purchase"] - rfm["first_purchase"]).dt.days
+    rfm["aov"] = rfm["monetary"] / rfm["frequency"]
+    
+    # RFM Scoring (quintiles 1-5, 5 is best)
+    # Recency: lower is better -> reverse score
+    rfm["R_score"] = pd.qcut(rfm["recency_days"].rank(method="first"), 5, labels=[5,4,3,2,1]).astype(int)
+    # Frequency: higher is better
+    rfm["F_score"] = pd.qcut(rfm["frequency"].rank(method="first"), 5, labels=[1,2,3,4,5]).astype(int)
+    # Monetary: higher is better
+    rfm["M_score"] = pd.qcut(rfm["monetary"].rank(method="first"), 5, labels=[1,2,3,4,5]).astype(int)
+    
+    rfm["RFM_score"] = rfm["R_score"].astype(str) + rfm["F_score"].astype(str) + rfm["M_score"].astype(str)
+    
+    # Segment mapping
+    def assign_segment(row):
+        r, f, m = row["R_score"], row["F_score"], row["M_score"]
+        if r >= 4 and f >= 4 and m >= 4:
+            return "Champions"
+        elif r >= 3 and f >= 4 and m >= 3:
+            return "Loyal Customers"
+        elif r >= 4 and f <= 2:
+            return "New Customers"
+        elif r >= 3 and f >= 3:
+            return "Potential Loyalists"
+        elif r <= 2 and f >= 3 and m >= 3:
+            return "At Risk High Value"
+        elif r <= 2 and f >= 2:
+            return "At Risk"
+        elif r <= 2 and f <= 2 and m <= 2:
+            return "Hibernating"
+        else:
+            return "Needs Attention"
+    
+    rfm["segment"] = rfm.apply(assign_segment, axis=1)
+    
+    return rfm
+
+def plot_rfm_segments(rfm: pd.DataFrame) -> tuple:
+    """Create RFM visualizations: segment bars + quadrant scatter."""
+    import matplotlib.pyplot as plt
+    
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5.5))
+    
+    # 1. Segment summary bars
+    seg_summary = rfm.groupby("segment").agg(
+        customers=("customer_id", "count"),
+        revenue=("monetary", "sum"),
+        avg_recency=("recency_days", "mean"),
+        avg_frequency=("frequency", "mean"),
+        avg_monetary=("monetary", "mean"),
+    ).sort_values("revenue", ascending=False)
+    
+    colors = [segment_color(s) for s in seg_summary.index]
+    bars = axes[0].barh(range(len(seg_summary)), seg_summary["revenue"], color=colors, edgecolor='white', height=0.6)
+    axes[0].set_yticks(range(len(seg_summary)))
+    axes[0].set_yticklabels([f"{s} ({c:,})" for s, c in zip(seg_summary.index, seg_summary["customers"])], fontsize=9)
+    axes[0].set_xlabel("Revenue", fontsize=10)
+    axes[0].set_title("Revenue by RFM Segment", fontsize=12, fontweight='bold')
+    axes[0].xaxis.set_major_formatter(plt.FuncFormatter(lambda x, _: fmt_currency(x)))
+    axes[0].spines['top'].set_visible(False)
+    axes[0].spines['right'].set_visible(False)
+    
+    # Add revenue labels
+    for bar, rev in zip(bars, seg_summary["revenue"]):
+        axes[0].text(bar.get_width() + max(seg_summary["revenue"])*0.01, bar.get_y() + bar.get_height()/2,
+                    fmt_currency(rev), va='center', fontsize=9)
+    
+    # 2. Quadrant scatter: Recency vs Monetary, sized by Frequency
+    ax = axes[1]
+    for seg in rfm["segment"].unique():
+        s = rfm[rfm["segment"] == seg]
+        ax.scatter(s["recency_days"], s["monetary"], 
+                  s=np.clip(s["frequency"] * 10, 20, 300), 
+                  alpha=0.5, label=seg, color=segment_color(seg), edgecolors='white', linewidth=0.3)
+    
+    # Quadrant lines
+    med_r = rfm["recency_days"].median()
+    med_m = rfm["monetary"].median()
+    ax.axvline(med_r, color='gray', linestyle='--', alpha=0.5, linewidth=1)
+    ax.axhline(med_m, color='gray', linestyle='--', alpha=0.5, linewidth=1)
+    
+    # Quadrant labels
+    ax.text(0.05, 0.95, "Champions\n(Recent, High Value)", transform=ax.transAxes, fontsize=9, va='top',
+           bbox=dict(boxstyle='round', facecolor='#c6f6d5', alpha=0.5))
+    ax.text(0.95, 0.95, "At Risk\nHigh Value", transform=ax.transAxes, fontsize=9, va='top', ha='right',
+           bbox=dict(boxstyle='round', facecolor='#fed7d7', alpha=0.5))
+    ax.text(0.05, 0.05, "New/Low Value", transform=ax.transAxes, fontsize=9, va='bottom',
+           bbox=dict(boxstyle='round', facecolor='#bee3f8', alpha=0.5))
+    ax.text(0.95, 0.05, "Hibernating\nLow Value", transform=ax.transAxes, fontsize=9, va='bottom', ha='right',
+           bbox=dict(boxstyle='round', facecolor='#feebc8', alpha=0.5))
+    
+    ax.set_xlabel("Recency (days since last purchase)", fontsize=10)
+    ax.set_ylabel("Monetary Value (Total Revenue)", fontsize=10)
+    ax.set_title("Customer Map: Recency vs Value (bubble = Frequency)", fontsize=12, fontweight='bold')
+    ax.set_yscale('log')
+    ax.spines['top'].set_visible(False)
+    ax.spines['right'].set_visible(False)
+    ax.grid(alpha=0.3)
+    ax.legend(fontsize=8, loc='upper right', framealpha=0.9)
+    
+    plt.tight_layout()
+    return fig, axes
+
+def plot_pareto(df: pd.DataFrame, value_col: str, label_col: str, top_n: int = 20, title: str = "Pareto Analysis") -> tuple:
+    """Create Pareto chart with cumulative percentage."""
+    import matplotlib.pyplot as plt
+    
+    pareto = df.nlargest(top_n, value_col).sort_values(value_col, ascending=False).reset_index(drop=True)
+    pareto["cum_pct"] = pareto[value_col].cumsum() / pareto[value_col].sum() * 100
+    pareto["rank"] = range(1, len(pareto) + 1)
+    
+    fig, ax1 = plt.subplots(figsize=(12, 5))
+    
+    # Bar chart
+    bars = ax1.bar(range(len(pareto)), pareto[value_col], color="#2b6cb0", edgecolor='white', width=0.7)
+    ax1.set_ylabel(value_col.replace("_", " ").title(), fontsize=10, color="#2b6cb0")
+    ax1.tick_params(axis='y', labelcolor="#2b6cb0")
+    
+    # Labels
+    ax1.set_xticks(range(len(pareto)))
+    ax1.set_xticklabels([str(l)[:20] for l in pareto[label_col]], rotation=45, ha='right', fontsize=8)
+    
+    # Cumulative line
+    ax2 = ax1.twinx()
+    ax2.plot(range(len(pareto)), pareto["cum_pct"], color="#e53e3e", marker='o', linewidth=2, markersize=4)
+    ax2.set_ylabel("Cumulative %", fontsize=10, color="#e53e3e")
+    ax2.tick_params(axis='y', labelcolor="#e53e3e")
+    ax2.axhline(y=80, color='gray', linestyle='--', alpha=0.5, linewidth=1)
+    ax2.text(len(pareto)-1, 82, "80% threshold", fontsize=8, color='gray')
+    
+    ax1.set_title(title, fontsize=13, fontweight='bold', pad=15)
+    ax1.spines['top'].set_visible(False)
+    ax2.spines['top'].set_visible(False)
+    
+    plt.tight_layout()
+    return fig, (ax1, ax2)
+
+def plot_category_contribution(current: dict, prior: dict, by: str = "category") -> tuple:
+    """Waterfall chart showing category/department contribution to revenue change."""
+    import matplotlib.pyplot as plt
+    
+    # This needs category-level data - will be called with pre-computed dict
+    # For now, return placeholder
+    fig, ax = plt.subplots(figsize=(10, 5))
+    ax.text(0.5, 0.5, f"{by.title()} Contribution Waterfall\n(Requires category-level period data)", 
+           ha='center', va='center', transform=ax.transAxes, fontsize=12)
+    ax.set_title(f"{by.title()} Contribution to Revenue Change", fontsize=13, fontweight='bold')
+    ax.axis('off')
+    return fig, ax
+
+def plot_cohort_retention_heatmap(cohort_data: pd.DataFrame) -> tuple:
+    """Plot cohort retention heatmap from analysis output."""
+    import matplotlib.pyplot as plt
+    
+    # cohort_data expected from analysis: cohort_month, months_since_cohort, retention_rate
+    if cohort_data.empty:
+        fig, ax = plt.subplots(figsize=(10, 5))
+        ax.text(0.5, 0.5, "No cohort data available", ha='center', va='center', transform=ax.transAxes)
+        return fig, ax
+    
+    # Pivot
+    pivot = cohort_data.pivot(index="cohort_month", columns="months_since_cohort", values="retention_rate")
+    pivot = pivot.sort_index()
+    
+    fig, ax = plt.subplots(figsize=(12, max(4, 0.3 * len(pivot) + 2)))
+    
+    im = ax.imshow(pivot.values, aspect='auto', cmap='RdYlGn', vmin=0, vmax=1)
+    
+    ax.set_xticks(range(len(pivot.columns)))
+    ax.set_xticklabels([f"M{c}" for c in pivot.columns], fontsize=9)
+    ax.set_yticks(range(len(pivot.index)))
+    ax.set_yticklabels([str(d)[:10] for d in pivot.index], fontsize=9)
+    
+    # Annotate cells
+    for i in range(len(pivot.index)):
+        for j in range(len(pivot.columns)):
+            val = pivot.iloc[i, j]
+            if not np.isnan(val):
+                color = 'white' if val < 0.5 else 'black'
+                ax.text(j, i, f"{val*100:.0f}%", ha='center', va='center', fontsize=8, color=color)
+    
+    ax.set_xlabel("Months Since First Purchase", fontsize=10)
+    ax.set_ylabel("Cohort (First Purchase Month)", fontsize=10)
+    ax.set_title("Cohort Retention Heatmap", fontsize=13, fontweight='bold', pad=15)
+    
+    cbar = plt.colorbar(im, ax=ax, format='%.0f%%')
+    cbar.set_label("Retention Rate", fontsize=9)
+    
+    plt.tight_layout()
+    return fig, ax
+
+def plot_anomaly_timeseries(dates: list, values: list, expected: list, upper: list, lower: list, 
+                           anomalies: list, title: str = "Anomaly Detection") -> tuple:
+    """Plot time series with expected range and anomaly markers."""
+    import matplotlib.pyplot as plt
+    
+    fig, ax = plt.subplots(figsize=(12, 4.5))
+    
+    # Expected range
+    ax.fill_between(dates, lower, upper, alpha=0.2, color='#2b6cb0', label='Expected Range (±2σ)')
+    
+    # Expected line
+    ax.plot(dates, expected, color='#2b6cb0', linestyle='--', linewidth=1.5, label='Expected')
+    
+    # Actual values
+    ax.plot(dates, values, color='#1a202c', linewidth=2, label='Actual')
+    ax.scatter(dates, values, color='#1a202c', s=20, zorder=5)
+    
+    # Anomaly markers
+    if anomalies:
+        anom_dates = [a["date"] for a in anomalies]
+        anom_values = [a["value"] for a in anomalies]
+        ax.scatter(anom_dates, anom_values, color='#e53e3e', s=80, marker='X', 
+                  zorder=10, label='Anomaly', edgecolors='white', linewidth=1)
+        
+        # Annotate anomalies
+        for a in anomalies:
+            ax.annotate(f"{a.get('pct_change', 0):+.0%}", 
+                       xy=(a["date"], a["value"]),
+                       xytext=(0, 15), textcoords='offset points',
+                       ha='center', fontsize=8, color='#e53e3e', fontweight='bold')
+    
+    ax.set_title(title, fontsize=13, fontweight='bold', pad=15)
+    ax.set_ylabel("Value", fontsize=10)
+    ax.legend(loc='upper left', fontsize=9)
+    ax.spines['top'].set_visible(False)
+    ax.spines['right'].set_visible(False)
+    ax.grid(axis='y', alpha=0.3)
+    
+    # Format x-axis dates
+    fig.autofmt_xdate(rotation=30)
+    
+    plt.tight_layout()
+    return fig, ax
+
+# Need numpy for some functions
+import numpy as np
 
 def filter_sidebar(df: pd.DataFrame) -> pd.DataFrame:
     """Add global filters in sidebar and return filtered dataframe."""
@@ -451,7 +1047,7 @@ def pretty(df: pd.DataFrame) -> pd.DataFrame:
 # --------------------------------------------------------------------------- #
 # Sidebar and data step
 # --------------------------------------------------------------------------- #
-def sidebar() -> dict[str, Any]:
+def sidebar(raw_df: pd.DataFrame | None = None) -> dict[str, Any]:
     sb = st.sidebar
     sb.title("Customer Insight Lab")
     sb.caption("Understand customers from line-item purchase data.")
@@ -483,6 +1079,65 @@ def sidebar() -> dict[str, Any]:
         p["excl_zero"] = st.checkbox("Exclude zero-quantity rows", value=False)
         p["excl_neg"] = st.checkbox("Exclude negative-price rows", value=False)
         p["seed"] = int(st.number_input("Analysis random seed", 0, 10_000, 42))
+    
+    # Period selection (only shown after analysis completes)
+    if raw_df is not None and not raw_df.empty:
+        with sb.expander("📅 Period Selection", expanded=True):
+            min_date = raw_df["transaction_day"].min()
+            max_date = raw_df["transaction_day"].max()
+            
+            preset = st.selectbox(
+                "Current period",
+                ["Last 7 days", "Last 28 days", "Last 90 days", "Month to date", "Quarter to date", "Custom range"],
+                index=1,
+                key="period_preset"
+            )
+            
+            if preset == "Last 7 days":
+                current_end = max_date
+                current_start = current_end - pd.Timedelta(days=6)
+            elif preset == "Last 28 days":
+                current_end = max_date
+                current_start = current_end - pd.Timedelta(days=27)
+            elif preset == "Last 90 days":
+                current_end = max_date
+                current_start = current_end - pd.Timedelta(days=89)
+            elif preset == "Month to date":
+                current_end = max_date
+                current_start = current_end.replace(day=1)
+            elif preset == "Quarter to date":
+                current_end = max_date
+                quarter_start_month = ((current_end.month - 1) // 3) * 3 + 1
+                current_start = current_end.replace(month=quarter_start_month, day=1)
+            else:
+                date_range = st.date_input(
+                    "Custom date range",
+                    value=(max_date - pd.Timedelta(days=27), max_date),
+                    min_value=min_date,
+                    max_value=max_date,
+                    key="custom_date_range"
+                )
+                if len(date_range) == 2:
+                    current_start = pd.Timestamp(date_range[0])
+                    current_end = pd.Timestamp(date_range[1])
+                else:
+                    current_start = max_date - pd.Timedelta(days=27)
+                    current_end = max_date
+            
+            st.caption(f"Current: {current_start.strftime('%Y-%m-%d')} to {current_end.strftime('%Y-%m-%d')}")
+            
+            compare_mode = st.selectbox(
+                "Compare to",
+                ["Prior period (equal length)", "Same period last year"],
+                index=0,
+                key="compare_mode"
+            )
+            compare_mode = "prior" if compare_mode == "Prior period (equal length)" else "yoy"
+            
+            p["current_start"] = current_start
+            p["current_end"] = current_end
+            p["compare_mode"] = compare_mode
+    
     return p
 
 
@@ -541,23 +1196,101 @@ def data_step(p: dict[str, Any]) -> tuple[pd.DataFrame | None, str | None]:
 # --------------------------------------------------------------------------- #
 # Result tabs
 # --------------------------------------------------------------------------- #
-def tab_overview(R: dict[str, Any]) -> None:
-    st.header("Overview")
+def tab_overview(R: dict[str, Any], raw_df: pd.DataFrame | None = None, period_params: dict | None = None) -> None:
+    st.header("1 Overview")
     st.caption("Question answered here: what is the headline picture of this customer base?")
     
     # Load and cache chart data
     chart_data = load_chart_data(R["results"], HEADLINE_CHARTS)
     kpis = compute_kpis_from_tables(chart_data)
     
-    # KPI Row
-    kpi_row(kpis)
+    # Executive KPI Tiles with Period Comparison
+    if raw_df is not None and period_params:
+        current_metrics = compute_period_metrics(raw_df, period_params["current_start"], period_params["current_end"])
+        
+        if period_params["compare_mode"] == "prior":
+            period_len = (period_params["current_end"] - period_params["current_start"]).days + 1
+            prior_end = period_params["current_start"] - pd.Timedelta(days=1)
+            prior_start = prior_end - pd.Timedelta(days=period_len - 1)
+        else:  # yoy
+            prior_start = period_params["current_start"] - pd.DateOffset(years=1)
+            prior_end = period_params["current_end"] - pd.DateOffset(years=1)
+        
+        prior_metrics = compute_period_metrics(raw_df, prior_start, prior_end)
+        
+        # Build KPI tiles with comparison
+        kpi_metrics = [
+            {
+                "label": "Revenue",
+                "current": fmt_currency(current_metrics["revenue"]),
+                "prior": fmt_currency(prior_metrics["revenue"]),
+                "change": fmt_currency(current_metrics["revenue"] - prior_metrics["revenue"]),
+                "pct_change": fmt_pct((current_metrics["revenue"] / prior_metrics["revenue"] - 1) * 100) if prior_metrics["revenue"] > 0 else "N/A",
+                "trend": "up" if current_metrics["revenue"] >= prior_metrics["revenue"] else "down",
+                "help_text": "Total revenue = quantity × unit_price"
+            },
+            {
+                "label": "Orders",
+                "current": fmt_number(current_metrics["orders"]),
+                "prior": fmt_number(prior_metrics["orders"]),
+                "change": fmt_number(current_metrics["orders"] - prior_metrics["orders"]),
+                "pct_change": fmt_pct((current_metrics["orders"] / prior_metrics["orders"] - 1) * 100) if prior_metrics["orders"] > 0 else "N/A",
+                "trend": "up" if current_metrics["orders"] >= prior_metrics["orders"] else "down",
+                "help_text": "Unique transaction_ids"
+            },
+            {
+                "label": "Active Customers",
+                "current": fmt_number(current_metrics["customers"]),
+                "prior": fmt_number(prior_metrics["customers"]),
+                "change": fmt_number(current_metrics["customers"] - prior_metrics["customers"]),
+                "pct_change": fmt_pct((current_metrics["customers"] / prior_metrics["customers"] - 1) * 100) if prior_metrics["customers"] > 0 else "N/A",
+                "trend": "up" if current_metrics["customers"] >= prior_metrics["customers"] else "down",
+                "help_text": "Unique customer_ids with purchases"
+            },
+            {
+                "label": "AOV",
+                "current": fmt_currency(current_metrics["aov"]),
+                "prior": fmt_currency(prior_metrics["aov"]),
+                "change": fmt_currency(current_metrics["aov"] - prior_metrics["aov"]),
+                "pct_change": fmt_pct((current_metrics["aov"] / prior_metrics["aov"] - 1) * 100) if prior_metrics["aov"] > 0 else "N/A",
+                "trend": "up" if current_metrics["aov"] >= prior_metrics["aov"] else "down",
+                "help_text": "Average Order Value = Revenue / Orders"
+            },
+            {
+                "label": "Units/Order",
+                "current": f"{current_metrics['units_per_order']:.1f}",
+                "prior": f"{prior_metrics['units_per_order']:.1f}",
+                "change": f"{current_metrics['units_per_order'] - prior_metrics['units_per_order']:+.1f}",
+                "pct_change": fmt_pct((current_metrics["units_per_order"] / prior_metrics["units_per_order"] - 1) * 100) if prior_metrics["units_per_order"] > 0 else "N/A",
+                "trend": "up" if current_metrics["units_per_order"] >= prior_metrics["units_per_order"] else "down",
+                "help_text": "Average basket size"
+            },
+            {
+                "label": "Revenue/Customer",
+                "current": fmt_currency(current_metrics["revenue_per_customer"]),
+                "prior": fmt_currency(prior_metrics["revenue_per_customer"]),
+                "change": fmt_currency(current_metrics["revenue_per_customer"] - prior_metrics["revenue_per_customer"]),
+                "pct_change": fmt_pct((current_metrics["revenue_per_customer"] / prior_metrics["revenue_per_customer"] - 1) * 100) if prior_metrics["revenue_per_customer"] > 0 else "N/A",
+                "trend": "up" if current_metrics["revenue_per_customer"] >= prior_metrics["revenue_per_customer"] else "down",
+                "help_text": "Average revenue per active customer"
+            },
+        ]
+        kpi_tile_row(kpi_metrics)
+        
+        st.markdown("---")
+        
+        # Revenue Waterfall Decomposition
+        section("Revenue Change Decomposition", "What drove the revenue change? Customer count, frequency, or basket value?")
+        waterfall_data = revenue_waterfall_data(current_metrics, prior_metrics)
+        fig, _ = plot_revenue_waterfall(waterfall_data)
+        chart_card(fig, f"Revenue changed by {fmt_currency(current_metrics['revenue'] - prior_metrics['revenue'])} ({fmt_pct((current_metrics['revenue'] / prior_metrics['revenue'] - 1) * 100)}) vs comparison period.")
     
-    # Revenue Bridge Waterfall - key finding
-    st.markdown("---")
-    section("Revenue Bridge: What changed?", "Prior period → New, Retained growth, Retained shrink, Reactivated, Churned, Returns → Current period")
+    else:
+        # Fallback to simple KPIs
+        kpi_row(kpis)
     
-    # Show headline charts
-    st.subheader("Key findings")
+    # Key findings from insight engine
+    st.subheader("Key Findings")
     by_key = {c["key"]: c for c in R["summary"].get("charts", [])}
     found = [by_key[k] for k in HEADLINE_CHARTS if k in by_key]
     if found:
@@ -966,6 +1699,240 @@ def tab_data(R: dict[str, Any]) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# New Tab Functions - Phase 2
+# --------------------------------------------------------------------------- #
+def tab_rfm(R: dict[str, Any], raw_df: pd.DataFrame | None = None, period_params: dict | None = None) -> None:
+    """RFM Analysis tab with customer segmentation and quadrant scatter."""
+    st.header("6 RFM Analysis")
+    st.caption("Question answered here: which customers are champions, at risk, or need attention?")
+    
+    cf = table(R, "customer_features")
+    if cf.empty:
+        st.info("No customer features available.")
+        return
+    
+    # Compute RFM from raw data if available
+    if raw_df is not None and period_params:
+        analysis_date = period_params["current_end"]
+        with st.spinner("Computing RFM segmentation..."):
+            rfm = compute_rfm(raw_df, analysis_date)
+    else:
+        # Use existing customer_features if it has RFM columns
+        if "rfm_segment" in cf.columns:
+            st.info("Using pre-computed RFM from analysis pipeline.")
+            # Create a simplified RFM view
+            rfm = cf.copy()
+            if "rfm_segment" in cf.columns:
+                rfm["segment"] = cf["rfm_segment"]
+            else:
+                rfm["segment"] = "Unknown"
+        else:
+            st.warning("RFM requires raw transaction data. Run analysis with raw data available.")
+            return
+    
+    # RFM Visualizations
+    st.subheader("RFM Segments")
+    fig, axes = plot_rfm_segments(rfm)
+    chart_card(fig, f"Identified {rfm['segment'].nunique()} RFM segments. Champions represent {rfm[rfm['segment']=='Champions']['monetary'].sum()/rfm['monetary'].sum()*100:.0f}% of revenue." if 'monetary' in rfm.columns else "RFM segmentation complete.")
+    
+    # Segment summary table
+    st.markdown("---")
+    st.subheader("Segment Summary")
+    seg_summary = rfm.groupby("segment").agg(
+        customers=("customer_id", "count"),
+        revenue=("monetary", "sum") if "monetary" in rfm.columns else ("customer_id", "count"),
+        avg_recency=("recency_days", "mean") if "recency_days" in rfm.columns else ("customer_id", "count"),
+        avg_frequency=("frequency", "mean") if "frequency" in rfm.columns else ("customer_id", "count"),
+        avg_monetary=("monetary", "mean") if "monetary" in rfm.columns else ("customer_id", "count"),
+    ).sort_values("revenue", ascending=False).reset_index()
+    
+    # Format for display
+    display_cols = ["segment", "customers"]
+    if "revenue" in seg_summary.columns:
+        display_cols.append("revenue")
+    if "avg_recency" in seg_summary.columns:
+        display_cols.extend(["avg_recency", "avg_frequency", "avg_monetary"])
+    
+    show_df(pretty(seg_summary[display_cols]))
+    
+    # Action recommendations
+    st.markdown("---")
+    st.subheader("Recommended Actions by Segment")
+    action_map = {
+        "Champions": "🟢 **Protect & Grow** - VIP treatment, early access, loyalty rewards",
+        "Loyal Customers": "🔵 **Cross-sell** - Bundle complementary categories, increase basket size",
+        "Potential Loyalists": "🟡 **Nurture** - Targeted offers to increase frequency",
+        "New Customers": "🟠 **Onboard** - Welcome series, second purchase incentives",
+        "At Risk High Value": "🔴 **Win-back** - Personal outreach, special offers",
+        "At Risk": "🔴 **Reactivate** - Win-back campaigns, feedback surveys",
+        "Hibernating": "⚪ **Low-cost reactivation** - Email reminders, small discounts",
+        "Needs Attention": "⚪ **Diagnose** - Analyze behavior patterns, test interventions",
+    }
+    
+    for seg, action in action_map.items():
+        count = len(rfm[rfm["segment"] == seg]) if seg in rfm["segment"].values else 0
+        if count > 0:
+            st.markdown(f"**{seg}** ({count:,} customers): {action}")
+
+
+def tab_cohort(R: dict[str, Any], raw_df: pd.DataFrame | None = None, period_params: dict | None = None) -> None:
+    """Cohort Retention tab with heatmap and revenue analysis."""
+    st.header("7 Cohort Retention")
+    st.caption("Question answered here: do newer cohorts retain better? Which cohorts are most valuable?")
+    
+    # Use pre-computed cohort data from analysis
+    cohort_data = table(R, "cohort_retention_new_customers")
+    
+    if cohort_data.empty:
+        st.info("No cohort retention data available. Run analysis with sufficient history.")
+        return
+    
+    st.subheader("Cohort Retention Heatmap")
+    fig, ax = plot_cohort_retention_heatmap(cohort_data)
+    chart_card(fig, f"Tracking {len(cohort_data['cohort_month'].unique())} cohorts. Darker green = higher retention.")
+    
+    # Cohort size and revenue
+    st.markdown("---")
+    st.subheader("Cohort Size & Revenue")
+    
+    # Get cohort sizes from customer_features
+    cf = table(R, "customer_features")
+    if not cf.empty and "observed_first_purchase_cohort_month" in cf.columns:
+        cohort_sizes = cf.groupby("observed_first_purchase_cohort_month").agg(
+            customers=("customer_id", "count"),
+            revenue=("net_spend", "sum") if "net_spend" in cf.columns else ("customer_id", "count"),
+        ).reset_index()
+        cohort_sizes.columns = ["cohort_month", "customers", "revenue"]
+        
+        col1, col2 = st.columns(2)
+        with col1:
+            st.markdown("**Cohort Sizes**")
+            show_df(pretty(cohort_sizes))
+        with col2:
+            st.markdown("**Cohort Revenue**")
+            show_df(pretty(cohort_sizes.sort_values("revenue", ascending=False)))
+    
+    # Retention table
+    st.markdown("---")
+    st.subheader("Retention Table (Complete Periods Only)")
+    show_df(pretty(cohort_data[cohort_data["period_complete"] == True].sort_values(["cohort_month", "months_since_cohort"])))
+    
+    # Key insights
+    st.markdown("---")
+    st.subheader("Key Insights")
+    
+    # Average month-1 retention
+    m1_data = cohort_data[(cohort_data["months_since_cohort"] == 1) & (cohort_data["period_complete"] == True)]
+    if len(m1_data):
+        avg_m1 = m1_data["retention_rate"].mean()
+        st.markdown(f"- **Average Month-1 Retention:** {avg_m1*100:.1f}%")
+        
+        # Trend
+        if len(m1_data) > 2:
+            recent = m1_data.tail(3)["retention_rate"].mean()
+            earlier = m1_data.head(3)["retention_rate"].mean()
+            trend = "improving" if recent > earlier else "declining"
+            st.markdown(f"- **Month-1 Retention Trend:** {trend} (recent 3 cohorts: {recent*100:.1f}% vs first 3: {earlier*100:.1f}%)")
+    
+    # Best/Worst cohorts
+    if len(cohort_data):
+        complete = cohort_data[cohort_data["period_complete"] == True]
+        if len(complete):
+            best = complete.loc[complete["retention_rate"].idxmax()]
+            worst = complete.loc[complete["retention_rate"].idxmin()]
+            st.markdown(f"- **Best Cohort Month:** {best['cohort_month']} at M{best['months_since_cohort']} = {best['retention_rate']*100:.1f}%")
+            st.markdown(f"- **Worst Cohort Month:** {worst['cohort_month']} at M{worst['months_since_cohort']} = {worst['retention_rate']*100:.1f}%")
+
+
+def tab_product_pareto(R: dict[str, Any], raw_df: pd.DataFrame | None = None, period_params: dict | None = None) -> None:
+    """Product Pareto Analysis tab."""
+    st.header("5 Products")
+    st.caption("Question answered here: which products drive revenue? Which are declining?")
+    
+    # Product summary from analysis
+    prod_summary = table(R, "product_summary")
+    cat_summary = table(R, "category_summary")
+    
+    if prod_summary.empty:
+        st.info("No product data available.")
+        return
+    
+    # Product Pareto
+    st.subheader("Product Revenue Pareto")
+    fig, _ = plot_pareto(prod_summary, "gross_purchase_revenue", "product_description", top_n=20, title="Top 20 Products by Revenue")
+    chart_card(fig, f"Top 20 products account for {prod_summary.nlargest(20, 'gross_purchase_revenue')['gross_purchase_revenue'].sum() / prod_summary['gross_purchase_revenue'].sum() * 100:.1f}% of revenue.")
+    
+    # Category Pareto
+    if not cat_summary.empty:
+        st.markdown("---")
+        st.subheader("Category Revenue Pareto")
+        fig, _ = plot_pareto(cat_summary, "gross_purchase_revenue", "category", top_n=15, title="Top 15 Categories by Revenue")
+        chart_card(fig, f"Top categories drive the majority of revenue.")
+    
+    # Product Movers - period over period
+    if raw_df is not None and period_params:
+        st.markdown("---")
+        st.subheader("Product Movers (Period vs Prior)")
+        
+        current_df = raw_df[
+            (raw_df["transaction_day"] >= period_params["current_start"]) & 
+            (raw_df["transaction_day"] <= period_params["current_end"])
+        ].copy()
+        
+        if period_params["compare_mode"] == "prior":
+            period_len = (period_params["current_end"] - period_params["current_start"]).days + 1
+            prior_end = period_params["current_start"] - pd.Timedelta(days=1)
+            prior_start = prior_end - pd.Timedelta(days=period_len - 1)
+        else:
+            prior_start = period_params["current_start"] - pd.DateOffset(years=1)
+            prior_end = period_params["current_end"] - pd.DateOffset(years=1)
+        
+        prior_df = raw_df[
+            (raw_df["transaction_day"] >= prior_start) & 
+            (raw_df["transaction_day"] <= prior_end)
+        ].copy()
+        
+        current_df["revenue"] = current_df["quantity"] * current_df["price"]
+        prior_df["revenue"] = prior_df["quantity"] * prior_df["price"]
+        
+        # Product revenue by period
+        curr_prod = current_df.groupby("product_id").agg(
+            revenue=("revenue", "sum"),
+            units=("quantity", "sum"),
+        ).reset_index()
+        curr_prod = curr_prod.merge(prod_summary[["product_id", "product_description"]], on="product_id", how="left")
+        
+        prior_prod = prior_df.groupby("product_id").agg(
+            revenue=("revenue", "sum"),
+        ).reset_index()
+        prior_prod.columns = ["product_id", "prior_revenue"]
+        
+        movers = curr_prod.merge(prior_prod, on="product_id", how="outer").fillna(0)
+        movers["revenue_change"] = movers["revenue"] - movers["prior_revenue"]
+        movers["pct_change"] = (movers["revenue_change"] / movers["prior_revenue"].replace(0, np.nan) * 100).round(1)
+        
+        # Top gainers and decliners
+        col1, col2 = st.columns(2)
+        with col1:
+            st.markdown("**Top Gainers**")
+            gainers = movers.nlargest(10, "revenue_change")[["product_description", "revenue", "prior_revenue", "revenue_change", "pct_change"]]
+            show_df(pretty(gainers))
+        
+        with col2:
+            st.markdown("**Top Decliners**")
+            decliners = movers.nsmallest(10, "revenue_change")[["product_description", "revenue", "prior_revenue", "revenue_change", "pct_change"]]
+            show_df(pretty(decliners))
+    
+    # Detailed tables
+    st.markdown("---")
+    for stem, title in (("product_summary", "Product Summary"), ("category_summary", "Category Summary"), ("department_summary", "Department Summary")):
+        t = table(R, stem)
+        if len(t):
+            with st.expander(title):
+                show_df(pretty(t.head(500)))
+
+
+# --------------------------------------------------------------------------- #
 # Main
 # --------------------------------------------------------------------------- #
 def landing() -> None:
@@ -989,7 +1956,13 @@ def main() -> None:
         st.error(f"Missing module: {exc}. Keep app.py, retail_customer_analysis.py and insight_engine.py in the same folder.")
         st.stop()
         return
-    p = sidebar()
+    
+    # Initialize session state for raw data
+    if "raw_df" not in st.session_state:
+        st.session_state["raw_df"] = None
+    
+    # Sidebar with raw data for period selector
+    p = sidebar(st.session_state["raw_df"])
     if "result" not in st.session_state:
         landing()
     else:
@@ -1012,16 +1985,34 @@ def main() -> None:
                 shutil.rmtree(old["work"], ignore_errors=True)
             st.session_state["result"] = R
             st.session_state["source_label"] = p["source"]
+            # Store raw data for period selection and RFM
+            st.session_state["raw_df"] = df.copy()
         except Exception as exc:
             st.error(f"{type(exc).__name__}: {exc}")
     R = st.session_state.get("result")
     if not R:
         return
+    
+    # Get period parameters from sidebar
+    period_params = {}
+    if "current_start" in p:
+        period_params = {
+            "current_start": p["current_start"],
+            "current_end": p["current_end"],
+            "compare_mode": p["compare_mode"],
+        }
+    
     st.caption(f"Showing results for: {st.session_state.get('source_label', 'data')}  |  {R['rows']:,} rows")
+    
+    # Prepare raw data for tabs
+    raw_df = st.session_state.get("raw_df")
+    
+    # Updated tabs with new sections
     tabs = st.tabs(TABS)
-    for tab, fn in zip(tabs, (tab_overview, tab_trust, tab_customers, tab_behaviour, tab_products, tab_explorer, tab_data)):
+    tab_functions = [tab_overview, tab_trust, tab_customers, tab_behaviour, tab_product_pareto, tab_rfm, tab_cohort, tab_explorer, tab_data]
+    for tab, fn in zip(tabs, tab_functions):
         with tab:
-            fn(R)
+            fn(R, raw_df, period_params)
 
 
 if __name__ == "__main__":
