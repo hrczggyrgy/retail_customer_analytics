@@ -1280,30 +1280,31 @@ def tab_overview(R: dict[str, Any], raw_df: pd.DataFrame | None = None, period_p
         # KPI Sparkline Trends - Small multiples across recent periods
         st.markdown("---")
         section("KPI Trends", "Recent trajectory across key metrics. Each sparkline shows the last 6 periods of the same length as your current selection.")
-        sparkline_fig = _plot_kpi_sparklines(raw_df, period_params)
-        if sparkline_fig:
-            chart_card(sparkline_fig, "Track whether improvements are sustained or one-off. Consistent upward trends across Revenue, Orders, and Customers signal healthy growth.")
+        sparkline_result = _plot_kpi_sparklines(raw_df, period_params)
+        if sparkline_result:
+            chart_card(sparkline_result[0], "Track whether improvements are sustained or one-off. Consistent upward trends across Revenue, Orders, and Customers signal healthy growth.")
         
         # Revenue Waterfall Decomposition
         st.markdown("---")
         section("Revenue Change Decomposition", "What drove the revenue change? Customer count, purchase frequency, units per order, or average unit price?")
         waterfall_data = revenue_waterfall_data(current_metrics, prior_metrics)
         fig, _ = plot_revenue_waterfall(waterfall_data)
-        chart_card(fig, f"Revenue changed by {fmt_currency(current_metrics['revenue'] - prior_metrics['revenue'])} ({fmt_pct((current_metrics['revenue'] / prior_metrics['revenue'] - 1) * 100)}) vs comparison period.")
+        pct_change = ((current_metrics['revenue'] / prior_metrics['revenue'] - 1) * 100) if prior_metrics['revenue'] > 0 else 0
+        chart_card(fig, f"Revenue changed by {fmt_currency(current_metrics['revenue'] - prior_metrics['revenue'])} ({fmt_pct(pct_change)}) vs comparison period.")
         
         # Category/Department Contribution to Revenue Change
         st.markdown("---")
         section("Category Contribution to Revenue Change", "Which categories drove growth or decline? Contribution = (category revenue change) / (total revenue change)")
-        contrib_fig = _plot_category_contribution_waterfall(raw_df, period_params)
-        if contrib_fig:
-            chart_card(contrib_fig, "Categories with the largest bars (positive or negative) are where to focus assortment, pricing, or promotion reviews.")
+        contrib_result = _plot_category_contribution_waterfall(raw_df, period_params)
+        if contrib_result:
+            chart_card(contrib_result[0], "Categories with the largest bars (positive or negative) are where to focus assortment, pricing, or promotion reviews.")
         
         # Year-over-Year Trend Comparison
         st.markdown("---")
         section("Year-over-Year Comparison", "Current period vs same period last year, aligned by calendar. Removes seasonality to show true performance.")
-        yoy_fig = _plot_yoy_comparison(raw_df, period_params)
-        if yoy_fig:
-            chart_card(yoy_fig, "Divergence between current and prior year lines indicates structural change, not just seasonality.")
+        yoy_result = _plot_yoy_comparison(raw_df, period_params)
+        if yoy_result:
+            chart_card(yoy_result[0], "Divergence between current and prior year lines indicates structural change, not just seasonality.")
         
         # Executive Narrative
         st.markdown("---")
@@ -1587,7 +1588,7 @@ def _render_executive_narrative(current_metrics: dict, prior_metrics: dict, peri
     
     direction = "increased" if rev_change >= 0 else "decreased"
     primary_name, primary_val = primary_driver
-    primary_pct = (abs(primary_val) / abs(rev_change) * 100) if rev_change != 0 else 0
+    primary_pct = (abs(primary_val) / abs(rev_change) * 100) if abs(rev_change) > 1e-10 else 0
     
     # Build narrative
     narrative = f"""
@@ -1599,26 +1600,41 @@ def _render_executive_narrative(current_metrics: dict, prior_metrics: dict, peri
     # Add secondary drivers
     sorted_effects = sorted(effects.items(), key=lambda x: abs(x[1]), reverse=True)
     for name, val in sorted_effects[1:3]:
-        if abs(val) > 0.01 * abs(rev_change):
-            pct = (abs(val) / abs(rev_change) * 100) if rev_change != 0 else 0
+        if abs(rev_change) > 1e-10 and abs(val) > 0.01 * abs(rev_change):
+            pct = (abs(val) / abs(rev_change) * 100) if abs(rev_change) > 1e-10 else 0
             narrative += f"\n\n- **{name}** contributed {fmt_currency(val)} ({pct:.0f}% of change)."
     
     # Add context on metric health
     narrative += "\n\n**Metric Health:**"
-    if current_metrics["customers"] >= prior_metrics["customers"]:
-        narrative += f" ✅ Customer base **grew** ({fmt_pct((c_cust/p_cust - 1)*100) if p_cust > 0 else 'N/A'})"
+    # Customer base
+    if p_cust > 0:
+        cust_pct = (c_cust / p_cust - 1) * 100
+        if c_cust >= p_cust:
+            narrative += f" ✅ Customer base **grew** ({fmt_pct(cust_pct)})"
+        else:
+            narrative += f" ⚠️ Customer base **shrank** ({fmt_pct(cust_pct)})"
     else:
-        narrative += f" ⚠️ Customer base **shrank** ({fmt_pct((c_cust/p_cust - 1)*100) if p_cust > 0 else 'N/A'})"
+        narrative += f" ⚠️ Customer base **N/A** (no prior customers)"
     
-    if current_metrics["aov"] >= prior_metrics["aov"]:
-        narrative += f" | ✅ AOV **improved** ({fmt_pct((c_aov/p_aov - 1)*100) if p_aov > 0 else 'N/A'})"
+    # AOV
+    if p_aov > 0:
+        aov_pct = (c_aov / p_aov - 1) * 100
+        if c_aov >= p_aov:
+            narrative += f" | ✅ AOV **improved** ({fmt_pct(aov_pct)})"
+        else:
+            narrative += f" | ⚠️ AOV **declined** ({fmt_pct(aov_pct)})"
     else:
-        narrative += f" | ⚠️ AOV **declined** ({fmt_pct((c_aov/p_aov - 1)*100) if p_aov > 0 else 'N/A'})"
+        narrative += f" | ⚠️ AOV **N/A**"
     
-    if current_metrics["units_per_order"] >= prior_metrics["units_per_order"]:
-        narrative += f" | ✅ Basket size **grew** ({fmt_pct((c_upo/p_upo - 1)*100) if p_upo > 0 else 'N/A'})"
+    # Basket size
+    if p_upo > 0:
+        upo_pct = (c_upo / p_upo - 1) * 100
+        if c_upo >= p_upo:
+            narrative += f" | ✅ Basket size **grew** ({fmt_pct(upo_pct)})"
+        else:
+            narrative += f" | ⚠️ Basket size **shrank** ({fmt_pct(upo_pct)})"
     else:
-        narrative += f" | ⚠️ Basket size **shrank** ({fmt_pct((c_upo/p_upo - 1)*100) if p_upo > 0 else 'N/A'})"
+        narrative += f" | ⚠️ Basket size **N/A**"
     
     st.markdown(narrative)
 
