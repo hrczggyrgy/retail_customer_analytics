@@ -2612,8 +2612,14 @@ def _plot_product_quadrant(raw_df: pd.DataFrame, period_params: dict, prod_summa
         prod_metrics["basket_penetration"] = prod_metrics["orders"] / total_orders * 100
         prod_metrics["rev_per_order"] = prod_metrics["revenue"] / prod_metrics["orders"]
         
-        # Merge with descriptions
-        prod_metrics = prod_metrics.merge(prod_summary[["product_id", "product_description", "category", "department"]], on="product_id", how="left")
+        # Merge with descriptions from raw data
+        if raw_df is not None and "product_description" in raw_df.columns:
+            desc_map = raw_df[["product_id", "product_description", "category", "department"]].drop_duplicates()
+            prod_metrics = prod_metrics.merge(desc_map, on="product_id", how="left")
+        else:
+            prod_metrics["product_description"] = prod_metrics["product_id"]
+            prod_metrics["category"] = "Unknown"
+            prod_metrics["department"] = "Unknown"
         
         # Filter to top products by revenue
         top_prods = prod_metrics.nlargest(50, "revenue")
@@ -2701,7 +2707,12 @@ def _plot_product_rank_change(raw_df: pd.DataFrame, period_params: dict, prod_su
         merged["prior_rank"] = merged["prior_rank"].fillna(len(merged) + 1).astype(int)
         merged["rank_change"] = merged["prior_rank"] - merged["curr_rank"]  # positive = improved
         
-        merged = merged.merge(prod_summary[["product_id", "product_description"]], on="product_id", how="left")
+        # Merge descriptions from raw data
+        if raw_df is not None and "product_description" in raw_df.columns:
+            desc_map = raw_df[["product_id", "product_description"]].drop_duplicates()
+            merged = merged.merge(desc_map, on="product_id", how="left")
+        else:
+            merged["product_description"] = merged["product_id"]
         
         # Top 15 by current revenue
         top_15 = merged.nsmallest(15, "curr_rank")
@@ -2780,7 +2791,11 @@ def _plot_top_product_trends(raw_df: pd.DataFrame, period_params: dict, prod_sum
             freq = "M"
         
         df_top = df[df["product_id"].isin(top_prods)].copy()
-        df_top = df_top.merge(prod_summary[["product_id", "product_description"]], on="product_id", how="left")
+        if raw_df is not None and "product_description" in raw_df.columns:
+            desc_map = raw_df[["product_id", "product_description"]].drop_duplicates()
+            df_top = df_top.merge(desc_map, on="product_id", how="left")
+        else:
+            df_top["product_description"] = df_top["product_id"]
         
         pivot = df_top.groupby([pd.Grouper(key="transaction_day", freq=freq), "product_description"])["revenue"].sum().unstack(fill_value=0)
         
@@ -3698,9 +3713,22 @@ def tab_product_pareto(R: dict[str, Any], raw_df: pd.DataFrame | None = None, pe
         st.info("No product data available.")
         return
     
+    # Merge product descriptions from raw data if available
+    label_col = "product_description"
+    if raw_df is not None and "product_description" in raw_df.columns and "product_id" in prod_summary.columns:
+        desc_map = raw_df[["product_id", "product_description"]].drop_duplicates()
+        prod_summary = prod_summary.merge(desc_map, on="product_id", how="left")
+        # Fill missing descriptions with product_id
+        prod_summary["product_description"] = prod_summary["product_description"].fillna(prod_summary["product_id"])
+    else:
+        # Fallback: use product_id as label
+        label_col = "product_id"
+        if "product_description" not in prod_summary.columns:
+            prod_summary["product_description"] = prod_summary["product_id"]
+    
     # Product Pareto
     st.subheader("Product Revenue Pareto")
-    fig, _ = plot_pareto(prod_summary, "gross_purchase_revenue", "product_description", top_n=20, title="Top 20 Products by Revenue")
+    fig, _ = plot_pareto(prod_summary, "gross_purchase_revenue", label_col, top_n=20, title="Top 20 Products by Revenue")
     chart_card(fig, f"Top 20 products account for {prod_summary.nlargest(20, 'gross_purchase_revenue')['gross_purchase_revenue'].sum() / prod_summary['gross_purchase_revenue'].sum() * 100:.1f}% of revenue.")
     
     # Category Pareto
@@ -3749,7 +3777,12 @@ def tab_product_pareto(R: dict[str, Any], raw_df: pd.DataFrame | None = None, pe
             revenue=("revenue", "sum"),
             units=("quantity", "sum"),
         ).reset_index()
-        curr_prod = curr_prod.merge(prod_summary[["product_id", "product_description"]], on="product_id", how="left")
+        # Merge descriptions from raw data
+        if raw_df is not None and "product_description" in raw_df.columns:
+            desc_map = raw_df[["product_id", "product_description"]].drop_duplicates()
+            curr_prod = curr_prod.merge(desc_map, on="product_id", how="left")
+        else:
+            curr_prod["product_description"] = curr_prod["product_id"]
         
         prior_prod = prior_df.groupby("product_id").agg(
             revenue=("revenue", "sum"),
