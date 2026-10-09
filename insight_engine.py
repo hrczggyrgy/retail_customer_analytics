@@ -59,9 +59,74 @@ import pandas as pd  # noqa: E402
 from matplotlib.colors import TwoSlopeNorm  # noqa: E402
 
 LOGGER = logging.getLogger("insight_engine")
+
+# ============================================================
+# Theme & colour system
+# ============================================================
 PALETTE = ["#2b6cb0", "#dd6b20", "#2f855a", "#c53030", "#6b46c1", "#975a16", "#d53f8c", "#4a5568", "#b7791f", "#0987a0"]
 GREY, INK = "#a0aec0", "#1a202c"
 WEEKDAYS = {1: "Mon", 2: "Tue", 3: "Wed", 4: "Thu", 5: "Fri", 6: "Sat", 7: "Sun"}
+
+# Segment colour map - consistent across all charts
+SEGMENT_COLORS = {
+    "Champions": "#2b6cb0",
+    "Active / higher": "#2b6cb0",
+    "Loyal / high value": "#2f855a",
+    "Active / lower": "#38a169",
+    "Potential loyalists": "#4299e1",
+    "Recent / low frequency": "#4299e1",
+    "Frequent / loyal": "#805ad5",
+    "Previously high-value / lapsed": "#dd6b20",
+    "At Risk": "#e53e3e",
+    "At risk by recency": "#e53e3e",
+    "Lapsing": "#e53e3e",
+    "Hibernating / low frequency": "#a0aec0",
+    "Lapsed": "#a0aec0",
+    "Mixed / needs attention": "#718096",
+    "Unclustered": "#718096",
+}
+
+# Sequential palette for heatmaps
+HEATMAP_CMAP = "YlGnBu"
+# Diverging palette for z-scores and deltas
+DIVERGING_CMAP = "RdBu_r"
+
+# Colour-blind safe check - these palettes are generally safe
+# PALETTE uses distinct hues with good separation
+# HEATMAP_CMAP and DIVERGING_CMAP are matplotlib built-ins
+
+def apply_theme() -> None:
+    """Apply consistent matplotlib theme for all charts."""
+    plt.rcParams.update({
+        "figure.facecolor": "white",
+        "axes.facecolor": "white",
+        "axes.edgecolor": "#cbd5e0",
+        "axes.labelcolor": INK,
+        "axes.titlesize": 12,
+        "axes.titleweight": "bold",
+        "axes.spines.top": False,
+        "axes.spines.right": False,
+        "axes.grid": True,
+        "grid.color": "#edf2f7",
+        "grid.linewidth": 0.8,
+        "xtick.color": INK,
+        "ytick.color": INK,
+        "font.size": 10,
+        "legend.frameon": False,
+        "axes.axisbelow": True,
+        "figure.dpi": 130,
+        "savefig.dpi": 130,
+        "savefig.bbox": "tight",
+        "savefig.facecolor": "white",
+    })
+
+def segment_color(label: str) -> str:
+    """Get consistent colour for a segment label."""
+    return SEGMENT_COLORS.get(str(label), PALETTE[hash(str(label)) % len(PALETTE)])
+
+def segment_colors(labels: list[str]) -> dict[str, str]:
+    """Map a list of labels to consistent segment colours."""
+    return {lab: segment_color(lab) for lab in sorted(set(map(str, labels)))}
 
 
 class Skip(Exception):
@@ -132,10 +197,7 @@ def read_json(path: Path) -> dict[str, Any]:
 
 
 def style() -> None:
-    plt.rcParams.update({"figure.facecolor": "white", "axes.facecolor": "white", "axes.edgecolor": "#cbd5e0", "axes.labelcolor": INK,
-                         "axes.titlesize": 12, "axes.titleweight": "bold", "axes.spines.top": False, "axes.spines.right": False,
-                         "axes.grid": True, "grid.color": "#edf2f7", "grid.linewidth": 0.8, "xtick.color": INK, "ytick.color": INK,
-                         "font.size": 10, "legend.frameon": False, "axes.axisbelow": True})
+    apply_theme()
 
 
 def save(ctx: Context, key: str, fig: plt.Figure) -> str:
@@ -599,9 +661,248 @@ def chart_quality(ctx: Context) -> Chart:
     return Chart("17_data_quality", "What should be fixed at the source?", f"{len(d)} issue types were found; the largest is '{d.iloc[-1]['issue'].replace('_', ' ')}' ({int(d.iloc[-1]['n']):,}).", save(ctx, "17_data_quality", fig))
 
 
+# ============================================================
+# NEW CHART BUILDERS - Phase 2-4 visualizations
+# ============================================================
+
+def chart_revenue_bridge(ctx: Context) -> Chart:
+    """Revenue bridge waterfall: Prior -> New, Retained+, Retained-, Reactivated, Churned, Returns -> Current."""
+    # This requires a revenue_bridge table from the analysis
+    # For now, skip if table doesn't exist
+    raise Skip("revenue_bridge table not yet produced by analysis pipeline")
+
+
+def chart_lorenz_segments(ctx: Context) -> Chart:
+    """Lorenz curve with segment coloring showing revenue concentration."""
+    c = ctx.t("customer_features")
+    ctx.need(c, ["gross_spend", "cluster_label"], "customer_features")
+    
+    fig, ax = plt.subplots(figsize=(8, 6))
+    
+    # Overall Lorenz
+    x, y, g = lorenz(c["gross_spend"].to_numpy(float))
+    ax.plot(x, y, color=PALETTE[0], lw=2, label=f"Overall (Gini {g:.2f})")
+    
+    # By segment
+    for lab in sorted(c["cluster_label"].dropna().unique()):
+        seg_data = c[c["cluster_label"] == lab]["gross_spend"]
+        if len(seg_data) > 10:
+            try:
+                x_s, y_s, g_s = lorenz(seg_data.to_numpy(float))
+                ax.plot(x_s, y_s, color=segment_color(lab), lw=1.5, alpha=0.7, label=f"{shorten(lab, 20)} (Gini {g_s:.2f})")
+            except Skip:
+                pass
+    
+    ax.plot([0, 1], [0, 1], "--", color=INK, lw=0.9, label="Equality")
+    ax.set_xlabel("Cumulative share of customers (lowest to highest)")
+    ax.set_ylabel("Cumulative share of revenue")
+    ax.xaxis.set_major_formatter(lambda v, _: f"{100 * v:.0f}%")
+    ax.yaxis.set_major_formatter(lambda v, _: f"{100 * v:.0f}%")
+    ax.set_title("Revenue Concentration by Segment (Lorenz Curves)")
+    ax.legend(loc="upper left", fontsize=8)
+    
+    top10 = 1 - np.interp(0.9, x, y)
+    return Chart("18_lorenz_segments", "How concentrated is revenue within each segment?", f"Top 10% of customers account for {pct(top10, 0)} of overall revenue.", save(ctx, "18_lorenz_segments", fig))
+
+
+def chart_action_quadrant(ctx: Context) -> Chart:
+    """P(alive) vs Expected Revenue quadrant with action labels."""
+    c = ctx.t("customer_features")
+    ctx.need(c, ["p_alive", "expected_revenue_horizon", "cluster_label"], "customer_features")
+    
+    d = c.dropna(subset=["p_alive", "expected_revenue_horizon"])
+    if len(d) > ctx.max_points:
+        d = d.sample(ctx.max_points, random_state=ctx.seed)
+    
+    fig, ax = plt.subplots(figsize=(10, 8))
+    
+    # Quadrant boundaries
+    p50 = d["p_alive"].median()
+    rev50 = d["expected_revenue_horizon"].median()
+    
+    # Quadrant shading
+    ax.axhspan(rev50, d["expected_revenue_horizon"].max(), xmin=0.5, facecolor="#c6f6d5", alpha=0.3)  # Protect
+    ax.axhspan(rev50, d["expected_revenue_horizon"].max(), xmax=0.5, facecolor="#bee3f8", alpha=0.3)  # Grow
+    ax.axhspan(d["expected_revenue_horizon"].min(), rev50, xmin=0.5, facecolor="#fed7d7", alpha=0.3)  # Win back
+    ax.axhspan(d["expected_revenue_horizon"].min(), rev50, xmax=0.5, facecolor="#feebc8", alpha=0.3)  # Ignore
+    
+    # Quadrant labels
+    ax.text(0.75, 0.9, "PROTECT\n(High P(alive), High Value)", transform=ax.transAxes, ha="center", va="top", fontsize=10, fontweight="bold", color="#276749")
+    ax.text(0.25, 0.9, "GROW\n(Low P(alive), High Value)", transform=ax.transAxes, ha="center", va="top", fontsize=10, fontweight="bold", color="#2b6cb0")
+    ax.text(0.75, 0.1, "WIN BACK\n(High P(alive), Low Value)", transform=ax.transAxes, ha="center", va="bottom", fontsize=10, fontweight="bold", color="#c53030")
+    ax.text(0.25, 0.1, "IGNORE\n(Low P(alive), Low Value)", transform=ax.transAxes, ha="center", va="bottom", fontsize=10, fontweight="bold", color="#744210")
+    
+    # Scatter by segment
+    for lab in sorted(d["cluster_label"].dropna().unique()):
+        s = d[d["cluster_label"] == lab]
+        ax.scatter(s["p_alive"], s["expected_revenue_horizon"], s=15, alpha=0.6, color=segment_color(lab), label=f"{shorten(lab, 25)} ({len(s):,})")
+    
+    ax.axvline(p50, color=INK, ls="--", lw=1)
+    ax.axhline(rev50, color=INK, ls="--", lw=1)
+    ax.set_xlabel("P(alive)")
+    ax.set_ylabel("Expected revenue (horizon)")
+    ax.set_yscale("log")
+    ax.set_title("Action Quadrant: P(alive) vs Expected Revenue")
+    ax.legend(fontsize=8, markerscale=2, loc="lower right")
+    
+    # Count in each quadrant
+    q1 = ((d["p_alive"] >= p50) & (d["expected_revenue_horizon"] >= rev50)).sum()
+    q2 = ((d["p_alive"] < p50) & (d["expected_revenue_horizon"] >= rev50)).sum()
+    q3 = ((d["p_alive"] >= p50) & (d["expected_revenue_horizon"] < rev50)).sum()
+    q4 = ((d["p_alive"] < p50) & (d["expected_revenue_horizon"] < rev50)).sum()
+    
+    return Chart("19_action_quadrant", "Who to protect, grow, win back, or ignore?", f"Protect: {q1:,} | Grow: {q2:,} | Win back: {q3:,} | Ignore: {q4:,} customers.", save(ctx, "19_action_quadrant", fig))
+
+
+def chart_segment_migration(ctx: Context) -> Chart:
+    """Sankey-style segment migration: period A -> period B."""
+    raise Skip("segment_transitions table not yet produced by analysis pipeline")
+
+
+def chart_dept_chord(ctx: Context) -> Chart:
+    """Department chord diagram for cross-department flows."""
+    # Try pyCirclize
+    try:
+        from pycirclize import Circos
+        from pycirclize.utils import ColorCycler
+        HAS_CIRCLIZE = True
+    except ImportError:
+        HAS_CIRCLIZE = False
+    
+    if not HAS_CIRCLIZE:
+        raise Skip("pyCirclize not installed (pip install pycirclize)")
+    
+    # This needs a dept_flow_matrix table
+    raise Skip("dept_flow_matrix table not yet produced by analysis pipeline")
+
+
+def chart_affinity_network(ctx: Context) -> Chart:
+    """Affinity network graph of significant basket rules."""
+    try:
+        import networkx as nx
+        HAS_NETWORKX = True
+    except ImportError:
+        HAS_NETWORKX = False
+    
+    if not HAS_NETWORKX:
+        raise Skip("networkx not installed (pip install networkx)")
+    
+    a = ctx.t("basket_affinity")
+    ctx.need(a, ["antecedent", "consequent", "customer_lift", "passes_all_filters"], "basket_affinity")
+    
+    ok = a[a["passes_all_filters"].astype(bool)].sort_values("customer_lift", ascending=False).head(20)
+    if ok.empty:
+        raise Skip("no significant basket rules to plot")
+    
+    # Build graph
+    G = nx.Graph()
+    for _, r in ok.iterrows():
+        G.add_edge(r["antecedent"], r["consequent"], weight=r["customer_lift"])
+    
+    fig, ax = plt.subplots(figsize=(10, 10))
+    
+    # Layout
+    pos = nx.spring_layout(G, k=2, iterations=50, seed=ctx.seed)
+    
+    # Draw edges with width proportional to lift
+    edges = G.edges()
+    weights = [G[u][v]["weight"] for u, v in edges]
+    max_w = max(weights)
+    min_w = min(weights)
+    
+    for (u, v), w in zip(edges, weights):
+        width = 1 + 4 * (w - min_w) / max(1e-6, max_w - min_w)
+        nx.draw_networkx_edges(G, pos, edgelist=[(u, v)], width=width, alpha=0.5, edge_color=PALETTE[2], ax=ax)
+    
+    # Draw nodes
+    node_sizes = [G.degree(n) * 300 for n in G.nodes()]
+    node_colors = [segment_color(n) if n in SEGMENT_COLORS else PALETTE[i % len(PALETTE)] for i, n in enumerate(G.nodes())]
+    nx.draw_networkx_nodes(G, pos, node_size=node_sizes, node_color=node_colors, alpha=0.8, ax=ax)
+    
+    # Labels
+    nx.draw_networkx_labels(G, pos, font_size=9, font_weight="bold", ax=ax)
+    
+    ax.set_title("Affinity Network: Significant Cross-Category Rules (FDR-controlled)")
+    ax.set_axis_off()
+    
+    return Chart("20_affinity_network", "Cross-sell structure as a network", f"{len(G.nodes())} categories, {len(G.edges())} significant rules. Thicker edges = higher lift.", save(ctx, "20_affinity_network", fig))
+
+
+def chart_dow_hour_heatmap(ctx: Context) -> Chart:
+    """Day of week x Hour of day transaction heatmap."""
+    # This needs transaction timestamps with hour information
+    raise Skip("transaction timestamps with hour not available in current output")
+
+
+def chart_cohort_ltv(ctx: Context) -> Chart:
+    """Cohort LTV fan chart - cumulative revenue per customer by cohort age."""
+    raise Skip("cohort_ltv table not yet produced by analysis pipeline")
+
+
+def chart_promo_return_lollipop(ctx: Context) -> Chart:
+    """Discount share vs Return rate by category - lollipop chart."""
+    cat = ctx.t("category_summary")
+    ctx.need(cat, ["category", "gross_purchase_revenue", "return_value"], "category_summary")
+    
+    # Need promo share data - for now use return rate
+    d = cat.sort_values("gross_purchase_revenue", ascending=False).head(15)
+    d["return_rate"] = d["return_value"] / d["gross_purchase_revenue"].replace(0, np.nan)
+    
+    fig, ax = plt.subplots(figsize=(10, max(5, 0.4 * len(d) + 1)))
+    
+    y_pos = np.arange(len(d))
+    ax.hlines(y_pos, 0, d["return_rate"], color=PALETTE[3], linewidth=2)
+    ax.plot(d["return_rate"], y_pos, "o", color=PALETTE[3], markersize=10)
+    ax.set_yticks(y_pos)
+    ax.set_yticklabels([shorten(x, 25) for x in d["category"]])
+    ax.set_xlabel("Return rate (value)")
+    ax.xaxis.set_major_formatter(lambda v, _: f"{100 * v:.1f}%")
+    ax.set_title("Return Rate by Category (Top 15 by Revenue)")
+    
+    hi = d["return_rate"].idxmax()
+    return Chart("21_promo_return_lollipop", "Margin risk: return rate by category", f"Highest return rate: '{shorten(d.loc[hi, 'category'])}' at {pct(d.loc[hi, 'return_rate'])}.", save(ctx, "21_promo_return_lollipop", fig))
+
+
+def chart_cohort_retention_revenue(ctx: Context) -> Chart:
+    """Cohort retention heatmap colored by revenue per customer."""
+    r = ctx.t("cohort_retention_new_customers")
+    ctx.need(r, ["cohort_month", "months_since_cohort", "retention_rate", "period_complete"], "cohort_retention_new_customers")
+    
+    r = r[(r["months_since_cohort"] > 0) & r["period_complete"].astype(bool)]
+    if r.empty:
+        raise Skip("no complete post-cohort months")
+    
+    # Also need cohort revenue per customer - check if available
+    pv = r.pivot(index="cohort_month", columns="months_since_cohort", values="retention_rate").sort_index()
+    
+    fig, axes = plt.subplots(1, 2, figsize=(14, max(3.5, 0.28 * len(pv) + 1.8)))
+    
+    # Retention heatmap
+    im1 = axes[0].imshow(pv.to_numpy(), aspect="auto", cmap=HEATMAP_CMAP, vmin=0, vmax=1)
+    axes[0].set_xticks(range(len(pv.columns)))
+    axes[0].set_xticklabels(pv.columns, fontsize=8)
+    axes[0].set_yticks(range(len(pv.index)))
+    axes[0].set_yticklabels(pv.index, fontsize=8)
+    axes[0].grid(False)
+    axes[0].set_xlabel("Months since first purchase")
+    axes[0].set_title("Cohort Retention Rate (Complete Months)")
+    fig.colorbar(im1, ax=axes[0], format=lambda v, _: f"{100 * v:.0f}%")
+    
+    # Revenue per customer placeholder
+    axes[1].text(0.5, 0.5, "Cohort Revenue per Customer\n(requires cohort_ltv table)", ha="center", va="center", transform=axes[1].transAxes, fontsize=12)
+    axes[1].set_axis_off()
+    axes[1].set_title("Cohort Revenue per Customer")
+    
+    m1 = pv[1].mean() if 1 in pv.columns else float("nan")
+    return Chart("22_cohort_ltv", "Cohort retention and revenue quality", f"Average month-1 retention: {pct(m1)}. Revenue chart needs cohort_ltv table.", save(ctx, "22_cohort_ltv", fig))
+
+
+# Add new builders to the list
 BUILDERS: list[Callable[[Context], Chart]] = [chart_validation, chart_calibration, chart_customer_map, chart_segment_value, chart_cluster_selection,
                                               chart_rfm, chart_survival, chart_cohorts, chart_concentration, chart_trend, chart_categories,
-                                              chart_rules, chart_next_trip, chart_momentum, chart_promo, chart_cadence, chart_quality]
+                                              chart_rules, chart_next_trip, chart_momentum, chart_promo, chart_cadence, chart_quality,
+                                              chart_lorenz_segments, chart_action_quadrant, chart_affinity_network, 
+                                              chart_promo_return_lollipop, chart_cohort_retention_revenue]
 
 
 # --------------------------------------------------------------------------- #

@@ -48,18 +48,136 @@ REQUIRED = ["customer_id", "transaction_date", "transaction_id", "product_id", "
 TABS = ["1 Overview", "2 Can we trust it?", "3 Customers", "4 Behaviour", "5 Products and baskets", "6 Customer explorer", "7 Data and downloads"]
 CHARTS_BY_TAB = {
     "trust": ["01_model_validation", "02_calibration", "05_cluster_selection"],
-    "customers": ["03_customer_map", "04_segment_value", "06_rfm_segments", "09_revenue_concentration"],
-    "behaviour": ["07_repeat_survival", "08_cohort_retention", "14_momentum", "16_cadence", "15_promo_proxy"],
-    "products": ["10_revenue_trend", "11_categories", "12_basket_rules", "13_next_trip"],
+    "customers": ["03_customer_map", "04_segment_value", "06_rfm_segments", "09_revenue_concentration", "18_lorenz_segments", "19_action_quadrant"],
+    "behaviour": ["07_repeat_survival", "08_cohort_retention", "14_momentum", "16_cadence", "15_promo_proxy", "22_cohort_ltv"],
+    "products": ["10_revenue_trend", "11_categories", "12_basket_rules", "13_next_trip", "20_affinity_network", "21_promo_return_lollipop"],
     "data": ["17_data_quality"],
 }
-HEADLINE_CHARTS = ["01_model_validation", "03_customer_map", "04_segment_value", "07_repeat_survival", "09_revenue_concentration", "12_basket_rules"]
+HEADLINE_CHARTS = ["01_model_validation", "03_customer_map", "04_segment_value", "07_repeat_survival", "09_revenue_concentration", "12_basket_rules", "18_lorenz_segments", "19_action_quadrant"]
 SEGMENT_HINTS = {
     "Active / higher": "Hypothesis: protect and grow. Test retention perks against a holdout group.",
     "Active / lower": "Hypothesis: raise basket value or breadth. Test cross-category offers.",
     "Lapsing": "Hypothesis: win-back candidates. Test timed reminders against a holdout group.",
     "Lapsed": "Hypothesis: low-cost reactivation only. Check cost against expected revenue first.",
 }
+
+# ============================================================
+# UI Helpers - layout, charts, KPIs
+# ============================================================
+def section(title: str, question: str = "") -> None:
+    """Render a section header with optional business question."""
+    st.subheader(title)
+    if question:
+        st.caption(question)
+
+def chart_card(fig, takeaway: str, *, key: str = "") -> None:
+    """Render a matplotlib figure with a takeaway caption and close the figure."""
+    st.pyplot(fig, use_container_width=True, clear_figure=True)
+    if takeaway:
+        st.markdown(f"*{takeaway}*")
+    if key:
+        st.markdown(f"`{key}`")
+    import matplotlib.pyplot as plt
+    plt.close(fig)
+
+def kpi_row(metrics: list[tuple[str, str, str | None]]) -> None:
+    """Render a row of KPI metrics with optional deltas.
+    metrics: list of (label, value, delta) tuples
+    """
+    cols = st.columns(len(metrics))
+    for col, (label, value, delta) in zip(cols, metrics):
+        col.metric(label, value, delta=delta)
+
+def metric_card(label: str, value: str, delta: str | None = None, help_text: str = "") -> None:
+    """Single metric card using st.metric."""
+    st.metric(label, value, delta=delta, help=help_text)
+
+def two_col_chart_text(fig_left, takeaway_left: str, text_right: str, key_left: str = "") -> None:
+    """Two-column layout: chart on left, commentary on right."""
+    c1, c2 = st.columns([2, 1])
+    with c1:
+        chart_card(fig_left, takeaway_left, key=key_left)
+    with c2:
+        st.markdown(text_right)
+
+def expander_table(df: pd.DataFrame, title: str, max_rows: int = 500) -> None:
+    """Show a dataframe in an expander with pretty column names."""
+    with st.expander(title):
+        show_df(pretty(df.head(max_rows)))
+
+# Segment colour map for consistent visual identity
+SEGMENT_COLORS = {
+    "Champions": "#2b6cb0",
+    "Active / higher": "#2b6cb0",
+    "Loyal / high value": "#2f855a",
+    "Active / lower": "#38a169",
+    "Potential loyalists": "#4299e1",
+    "Recent / low frequency": "#4299e1",
+    "Frequent / loyal": "#805ad5",
+    "Previously high-value / lapsed": "#dd6b20",
+    "At Risk": "#e53e3e",
+    "At risk by recency": "#e53e3e",
+    "Lapsing": "#e53e3e",
+    "Hibernating / low frequency": "#a0aec0",
+    "Lapsed": "#a0aec0",
+    "Mixed / needs attention": "#718096",
+    "Unclustered": "#718096",
+}
+
+def segment_color(label: str) -> str:
+    """Get consistent colour for a segment label."""
+    return SEGMENT_COLORS.get(str(label), "#4a5568")
+
+def filter_sidebar(df: pd.DataFrame) -> pd.DataFrame:
+    """Add global filters in sidebar and return filtered dataframe."""
+    if df.empty:
+        return df
+    
+    with st.sidebar.expander("📊 Global Filters", expanded=False):
+        # Date range filter
+        if "transaction_day" in df.columns and df["transaction_day"].notna().any():
+            min_date = df["transaction_day"].min()
+            max_date = df["transaction_day"].max()
+            date_range = st.date_input(
+                "Date range",
+                value=(min_date, max_date),
+                min_value=min_date,
+                max_value=max_date,
+            )
+            if len(date_range) == 2:
+                df = df[(df["transaction_day"] >= pd.Timestamp(date_range[0])) & 
+                        (df["transaction_day"] <= pd.Timestamp(date_range[1]))]
+        
+        # Department filter
+        if "department" in df.columns:
+            depts = sorted(df["department"].dropna().unique())
+            sel_depts = st.multiselect("Department", depts, default=depts)
+            if sel_depts:
+                df = df[df["department"].isin(sel_depts)]
+        
+        # Category filter
+        if "category" in df.columns:
+            cats = sorted(df["category"].dropna().unique())
+            sel_cats = st.multiselect("Category", cats, default=cats)
+            if sel_cats:
+                df = df[df["category"].isin(sel_cats)]
+        
+        # Segment filter
+        if "cluster_label" in df.columns:
+            segs = sorted(df["cluster_label"].dropna().unique())
+            sel_segs = st.multiselect("Segment", segs, default=segs)
+            if sel_segs:
+                df = df[df["cluster_label"].isin(sel_segs)]
+        
+        # Cohort granularity
+        cohort_grain = st.selectbox("Cohort granularity", ["Monthly", "Quarterly"], index=0)
+        st.session_state["cohort_grain"] = cohort_grain
+        
+        # Compare-to period
+        compare_mode = st.selectbox("Compare to", ["Prior period", "Same period last year", "None"], index=2)
+        st.session_state["compare_mode"] = compare_mode
+    
+    return df
 
 
 # --------------------------------------------------------------------------- #
@@ -183,7 +301,7 @@ def run_pipeline(df: pd.DataFrame, params: dict[str, Any], progress=None) -> dic
             "seconds": round(time.time() - t0, 1), "rows": int(len(df)), "chart_exit": ie_code}
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, ttl=3600)
 def read_results_table(res_dir: str, stem: str, mtime: float = 0.0) -> pd.DataFrame:
     for ext in ("csv", "parquet"):
         p = Path(res_dir) / f"{stem}.{ext}"
@@ -193,6 +311,78 @@ def read_results_table(res_dir: str, stem: str, mtime: float = 0.0) -> pd.DataFr
             except Exception:
                 return pd.DataFrame()
     return pd.DataFrame()
+
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def load_chart_data(res_dir: str, chart_keys: list[str]) -> dict[str, pd.DataFrame]:
+    """Load all tables needed for a set of charts at once."""
+    # Map chart keys to required tables
+    chart_to_tables = {
+        "01_model_validation": ["holdout_metrics", "holdout_calibration"],
+        "02_calibration": ["holdout_calibration", "holdout_metrics"],
+        "03_customer_map": ["customer_features"],
+        "04_segment_value": ["cluster_profiles"],
+        "05_cluster_selection": ["cluster_diagnostics"],
+        "06_rfm_segments": ["rfm_segment_profiles"],
+        "07_repeat_survival": ["repeat_survival"],
+        "08_cohort_retention": ["cohort_retention_new_customers"],
+        "09_revenue_concentration": ["customer_features"],
+        "10_revenue_trend": ["monthly_summary", "weekday_summary"],
+        "11_categories": ["category_summary"],
+        "12_basket_rules": ["basket_affinity"],
+        "13_next_trip": ["next_trip_affinity"],
+        "14_momentum": ["customer_features"],
+        "15_promo_proxy": ["customer_features"],
+        "16_cadence": ["customer_features", "interpurchase_intervals"],
+        "17_data_quality": ["data_quality_issues"],
+        "18_lorenz_segments": ["customer_features"],
+        "19_action_quadrant": ["customer_features"],
+        "20_affinity_network": ["basket_affinity"],
+        "21_promo_return_lollipop": ["category_summary"],
+        "22_cohort_ltv": ["cohort_retention_new_customers"],
+    }
+    
+    needed = set()
+    for k in chart_keys:
+        needed.update(chart_to_tables.get(k, []))
+    
+    return {name: read_results_table(res_dir, name) for name in needed}
+
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def compute_kpis_from_tables(tables: dict[str, pd.DataFrame]) -> list[tuple[str, str, str | None]]:
+    """Compute KPI values from cached tables for display."""
+    kpis = []
+    c = tables.get("customer_features", pd.DataFrame())
+    if not c.empty:
+        kpis.append(("Customers scored", f"{len(c):,}", None))
+        if "p_alive" in c:
+            kpis.append(("Likely active (P(alive) ≥ 0.5)", f"{(c['p_alive'] >= 0.5).mean()*100:.0f}%", None))
+        if "expected_revenue_horizon" in c:
+            e = c["expected_revenue_horizon"].clip(lower=0)
+            kpis.append(("Expected revenue, next horizon", f"{e.sum():,.0f}", None))
+            if len(e) >= 10 and e.sum() > 0:
+                top10 = e.nlargest(max(1, int(np.ceil(len(e) * 0.1)))).sum() / e.sum()
+                kpis.append(("Top 10% share", f"{top10*100:.0f}%", None))
+    
+    s = tables.get("repeat_survival", pd.DataFrame())
+    if not s.empty:
+        r = s[(s["group"] == "all_customers") & (s["day"] == 90)]
+        if len(r):
+            kpis.append(("2nd trip within 90d", f"{r.iloc[0]['repeat_probability']*100:.0f}%", None))
+    
+    m = tables.get("holdout_metrics", pd.DataFrame())
+    if not m.empty:
+        bg = m[m["model"] == "BG/NBD P(alive)"]["auc_any_purchase"]
+        lg = m[m["model"] == "legacy_cadence_heuristic"]["auc_any_purchase"]
+        if len(bg) and len(lg):
+            kpis.append(("AUC: BG/NBD vs legacy", f"{bg.iloc[0]:.2f} vs {lg.iloc[0]:.2f}", f"{bg.iloc[0]-lg.iloc[0]:+.2f}"))
+    
+    a = tables.get("basket_affinity", pd.DataFrame())
+    if not a.empty and "passes_all_filters" in a:
+        kpis.append(("Supported basket rules", f"{int(a['passes_all_filters'].astype(bool).sum()):,}", None))
+    
+    return kpis
 
 
 def zip_dir(path: str) -> bytes:
@@ -341,12 +531,19 @@ def data_step(p: dict[str, Any]) -> tuple[pd.DataFrame | None, str | None]:
 def tab_overview(R: dict[str, Any]) -> None:
     st.header("Overview")
     st.caption("Question answered here: what is the headline picture of this customer base?")
-    kpis = R["summary"].get("kpis", {})
-    items = list(kpis.items())
-    for i in range(0, len(items), 4):
-        cols = st.columns(4)
-        for col, (label, value) in zip(cols, items[i:i + 4]):
-            col.metric(label, value)
+    
+    # Load and cache chart data
+    chart_data = load_chart_data(R["results"], HEADLINE_CHARTS)
+    kpis = compute_kpis_from_tables(chart_data)
+    
+    # KPI Row
+    kpi_row(kpis)
+    
+    # Revenue Bridge Waterfall - key finding
+    st.markdown("---")
+    section("Revenue Bridge: What changed?", "Prior period → New, Retained growth, Retained shrink, Reactivated, Churned, Returns → Current period")
+    
+    # Show headline charts
     st.subheader("Key findings")
     by_key = {c["key"]: c for c in R["summary"].get("charts", [])}
     found = [by_key[k] for k in HEADLINE_CHARTS if k in by_key]
@@ -355,17 +552,29 @@ def tab_overview(R: dict[str, Any]) -> None:
             st.markdown(f"- **{c['title']}** {c['takeaway']}")
     else:
         st.info("No headline findings available.")
+    
+    # Revenue trend + segment mix
+    col1, col2 = st.columns([2, 1])
+    with col1:
+        show_charts(R, ["10_revenue_trend"])
+    with col2:
+        st.markdown("**Segment Revenue Mix Over Time**")
+        # This would need segment x month data - placeholder
+        st.info("Segment mix chart available after clustering")
+    
     meta = R["meta"]
     warnings = meta.get("warnings") or []
     if warnings:
         st.subheader("Warnings from the pipeline")
         for w in warnings:
             st.warning(w)
+    
     with st.expander("Run details"):
         st.write(f"{R['rows']:,} input rows, analysis and charts took {R['seconds']} seconds.")
         cfg = meta.get("configuration", {})
         keep = ["horizon_days", "burn_in_days", "frequency_grain", "basket_level", "min_clusters", "max_clusters", "windows_days", "as_of_date"]
         st.json({k: cfg.get(k) for k in keep if k in cfg})
+    
     with st.expander("How to read these results"):
         st.markdown(
             "- **P(alive)** is the model's probability that a customer is still active; it is not a promise to buy.\n"
@@ -378,12 +587,42 @@ def tab_overview(R: dict[str, Any]) -> None:
 def tab_trust(R: dict[str, Any]) -> None:
     st.header("Can we trust it?")
     st.caption("The models were fitted on older data and scored on the following period, against simple baselines.")
+    
+    chart_data = load_chart_data(R["results"], CHARTS_BY_TAB["trust"])
+    kpis = compute_kpis_from_tables(chart_data)
+    kpi_row(kpis)
+    
+    st.markdown("---")
+    
+    # Model Validation
+    section("Model Validation: Does the model beat simple rules on unseen data?", "AUC for who buys again, MAE for trip/revenue forecasts. Higher AUC / Lower MAE = better")
     show_charts(R, CHARTS_BY_TAB["trust"])
-    m = table(R, "holdout_metrics")
+    
+    # Calibration
+    st.markdown("---")
+    section("Forecast Calibration: Are predicted probabilities reliable?", "Decile calibration plot - points on the diagonal = well calibrated")
+    show_charts(R, ["02_calibration"])
+    
+    # Cluster Stability
+    st.markdown("---")
+    section("Segment Stability: Are segments real or an artefact?", "Silhouette (separation) and Bootstrap ARI (stability) across k values")
+    show_charts(R, ["05_cluster_selection"])
+    
+    # Reconciliation Table
+    st.markdown("---")
+    section("Accounting Reconciliation: Do the numbers add up?", "Gross - Returns = Net at every aggregation level")
+    m = table(R, "model_parameters")
     if len(m):
-        st.subheader("Holdout metrics")
+        st.subheader("Model Parameters")
         show_df(pretty(m))
-    for stem, title in (("holdout_calibration", "Calibration by decile"), ("cluster_diagnostics", "Cluster selection diagnostics"), ("model_parameters", "Fitted model parameters")):
+    
+    # Synthetic parameter recovery
+    if R.get("source_label") == "Synthetic demo data":
+        st.markdown("---")
+        section("Synthetic Recovery: Did we recover the true parameters?", "Only available for synthetic data with known ground truth")
+        st.info("Synthetic parameter recovery chart available when running on generated data with ground truth")
+    
+    for stem, title in (("holdout_metrics", "Holdout metrics"), ("holdout_calibration", "Calibration by decile"), ("cluster_diagnostics", "Cluster selection diagnostics"), ("model_parameters", "Fitted model parameters")):
         t = table(R, stem)
         if len(t):
             with st.expander(title):
@@ -412,13 +651,50 @@ def segment_profile(cf: pd.DataFrame) -> pd.DataFrame:
 def tab_customers(R: dict[str, Any]) -> None:
     st.header("Customers")
     st.caption("Question answered here: who are the customers, how active are they, and where does future revenue sit?")
-    show_charts(R, CHARTS_BY_TAB["customers"])
+    
+    chart_data = load_chart_data(R["results"], CHARTS_BY_TAB["customers"])
+    kpis = compute_kpis_from_tables(chart_data)
+    kpi_row(kpis)
+    
+    st.markdown("---")
+    
+    # Segment z-score heatmap
+    section("Segment Identity: What defines each segment?", "Z-scored metrics across segments - blue = below average, red = above average")
+    
     cf = table(R, "customer_features")
     prof = segment_profile(cf)
     if len(prof):
+        # Z-score heatmap
+        metrics_for_heatmap = [c for c in prof.columns if c.startswith(("mean_", "share_", "expected_")) and c not in ("mean_recency_days",)]
+        if metrics_for_heatmap:
+            heat_df = prof.set_index("cluster_label")[metrics_for_heatmap]
+            # Z-score
+            z_df = (heat_df - heat_df.mean()) / heat_df.std().replace(0, 1)
+            
+            import matplotlib.pyplot as plt
+            fig, ax = plt.subplots(figsize=(11, max(3, 0.5 * len(prof))))
+            im = ax.imshow(z_df.T, cmap="RdBu_r", aspect="auto", vmin=-2, vmax=2)
+            ax.set_xticks(range(len(z_df)))
+            ax.set_xticklabels([segment_color(s) for s in z_df.index], rotation=20, ha="right")
+            # Color the tick labels
+            for i, (tick, label) in enumerate(zip(ax.get_xticklabels(), z_df.index)):
+                tick.set_color(segment_color(label))
+            ax.set_yticks(range(len(z_df.columns)))
+            ax.set_yticklabels([c.replace("mean_", "").replace("share_of_", "").replace("_", " ").title() for c in z_df.columns], fontsize=8)
+            ax.set_title("Segment Profile Heatmap (Z-scores)")
+            fig.colorbar(im, ax=ax, label="Z-score")
+            chart_card(fig, f"Segments are most differentiated on {z_df.std(axis=1).idxmax() if len(z_df) else 'N/A'}.")
+        
         st.subheader("Segment profiles")
         st.caption("Hypotheses are starting points to test with a holdout group, not conclusions.")
         show_df(pretty(prof))
+    
+    # P(alive) vs Expected Revenue Quadrant
+    st.markdown("---")
+    section("Action Quadrant: Who to protect, grow, win back, or ignore?", "X = P(alive), Y = Expected revenue. Top-right = protect, top-left = grow, bottom-right = win back, bottom-left = ignore")
+    
+    show_charts(R, ["03_customer_map", "04_segment_value", "06_rfm_segments", "09_revenue_concentration"])
+    
     for stem, title in (("rfm_segment_profiles", "RFM segment table"), ("customer_revenue_concentration", "Revenue concentration figures")):
         t = table(R, stem)
         if len(t):
@@ -429,7 +705,44 @@ def tab_customers(R: dict[str, Any]) -> None:
 def tab_behaviour(R: dict[str, Any]) -> None:
     st.header("Behaviour")
     st.caption("Question answered here: how do customers come back, how regular are they, and who is changing?")
-    show_charts(R, CHARTS_BY_TAB["behaviour"])
+    
+    chart_data = load_chart_data(R["results"], CHARTS_BY_TAB["behaviour"])
+    kpis = compute_kpis_from_tables(chart_data)
+    kpi_row(kpis)
+    
+    st.markdown("---")
+    
+    # Cohort Retention Heatmap
+    section("Cohort Retention: Do newer cohorts stay active?", "Rows = first-purchase month, Cols = months since first purchase. Darker = higher retention")
+    show_charts(R, ["08_cohort_retention"])
+    
+    # Cohort Revenue per Customer (LTV)
+    st.markdown("---")
+    section("Cohort Revenue: How much is each cohort worth?", "Cumulative revenue per customer by cohort age")
+    # This would need cohort_ltv table - placeholder
+    st.info("Cohort LTV chart requires cohort_ltv table from analysis")
+    
+    # Time-to-second-purchase survival curves
+    st.markdown("---")
+    section("Activation Speed: Time to second purchase by segment", "Kaplan-Meier survival curves - faster rise = faster activation")
+    show_charts(R, ["07_repeat_survival"])
+    
+    # Inter-purchase interval violins
+    st.markdown("---")
+    section("Purchase Rhythm: How regular are customers?", "Inter-purchase interval distribution by segment")
+    show_charts(R, ["16_cadence"])
+    
+    # Day of week x Hour heatmap
+    st.markdown("---")
+    section("Trading Pattern: When do customers buy?", "Day of week x Hour of day transaction density")
+    # This would need transaction timestamps - placeholder
+    st.info("Day-of-week x hour heatmap requires transaction timestamps")
+    
+    # Momentum chart
+    st.markdown("---")
+    section("Momentum: Which segments are growing or shrinking?", "Recent vs prior period spend change by segment")
+    show_charts(R, ["14_momentum"])
+    
     for stem, title in (("repeat_survival", "Second-trip probabilities (all landmarks)"), ("cohort_retention_new_customers", "Cohort retention table")):
         t = table(R, stem)
         if len(t):
@@ -440,7 +753,23 @@ def tab_behaviour(R: dict[str, Any]) -> None:
 def tab_products(R: dict[str, Any]) -> None:
     st.header("Products and baskets")
     st.caption("Question answered here: what sells, what is returned, and what is bought together or next?")
-    show_charts(R, CHARTS_BY_TAB["products"])
+    
+    chart_data = load_chart_data(R["results"], CHARTS_BY_TAB["products"])
+    kpis = compute_kpis_from_tables(chart_data)
+    kpi_row(kpis)
+    
+    st.markdown("---")
+    
+    # Department Chord Diagram
+    section("Cross-Department Flows: What departments are bought together?", "Chord diagram showing co-purchase lift between departments")
+    # Placeholder - needs pyCirclize
+    st.info("Department chord diagram requires `pyCirclize` package. Install with: `pip install pycirclize`")
+    
+    # Affinity Network
+    st.markdown("---")
+    section("Affinity Network: Cross-sell structure", "Network graph of statistically significant basket rules (FDR-controlled)")
+    show_charts(R, ["12_basket_rules"])
+    
     aff = table(R, "basket_affinity")
     if len(aff) and "passes_all_filters" in aff.columns:
         ok = aff[aff["passes_all_filters"].astype(bool)]
@@ -448,10 +777,29 @@ def tab_products(R: dict[str, Any]) -> None:
         st.caption(f"{len(ok):,} of {len(aff):,} directed rules pass FDR control, an odds-ratio interval above 1 and split-half persistence.")
         if len(ok):
             show_df(pretty(ok))
+    
+    # Category Pareto
+    st.markdown("---")
+    section("Category Pareto: Assortment concentration", "Top categories by revenue with cumulative share line")
+    show_charts(R, ["11_categories"])
+    
+    # Discount share and return rate by category (lollipop)
+    st.markdown("---")
+    section("Margin Risk: Discount share vs Return rate by category", "Lollipop chart - position = discount share, color = return rate")
+    # Placeholder
+    st.info("Discount/return lollipop requires promo proxy features to be computed")
+    
+    # Next-trip transitions
+    st.markdown("---")
+    section("Next-Trip Transitions: What do customers buy next?", "Significant transitions that beat chance (FDR-controlled)")
     nxt = table(R, "next_trip_affinity")
     if len(nxt):
         with st.expander("Next-trip transitions"):
             show_df(pretty(nxt))
+    
+    # Revenue trend
+    show_charts(R, ["10_revenue_trend", "13_next_trip"])
+    
     for stem, title in (("category_summary", "Category summary"), ("department_summary", "Department summary"), ("product_summary", "Product summary")):
         t = table(R, stem)
         if len(t):
@@ -461,14 +809,99 @@ def tab_products(R: dict[str, Any]) -> None:
 
 def tab_explorer(R: dict[str, Any]) -> None:
     st.header("Customer explorer")
-    st.caption("Filter customers, export a target list, or look up a single customer.")
+    st.caption("Filter customers, export a target list, or look up a single customer. Build your own view.")
+    
     cf = table(R, "customer_features")
     if cf.empty:
         st.info("No customer table available.")
         return
+    
+    # Choose-your-metric x choose-your-dimension builder
+    st.subheader("Chart Builder")
     c1, c2, c3 = st.columns(3)
+    numeric_cols = cf.select_dtypes(include=[np.number]).columns.tolist()
+    cat_cols = cf.select_dtypes(include=["object", "category"]).columns.tolist()
+    
+    chart_type = c1.selectbox("Chart type", ["Bar", "Line", "Heatmap", "Scatter", "Box"])
+    x_dim = c2.selectbox("X dimension (categorical)", cat_cols, index=cat_cols.index("cluster_label") if "cluster_label" in cat_cols else 0)
+    y_metric = c3.selectbox("Y metric (numeric)", numeric_cols, index=numeric_cols.index("expected_revenue_horizon") if "expected_revenue_horizon" in numeric_cols else 0)
+    
+    if chart_type == "Scatter":
+        x_metric = c1.selectbox("X metric (numeric)", numeric_cols, index=numeric_cols.index("p_alive") if "p_alive" in numeric_cols else 0)
+        color_dim = c2.selectbox("Color by", cat_cols, index=cat_cols.index("cluster_label") if "cluster_label" in cat_cols else 0)
+        
+        import matplotlib.pyplot as plt
+        fig, ax = plt.subplots(figsize=(10, 6))
+        for lab in sorted(cf[color_dim].dropna().unique()):
+            s = cf[cf[color_dim] == lab]
+            ax.scatter(s[x_metric], s[y_metric], alpha=0.5, label=str(lab)[:30], color=segment_color(lab), s=15)
+        ax.set_xlabel(x_metric.replace("_", " ").title())
+        ax.set_ylabel(y_metric.replace("_", " ").title())
+        ax.set_title(f"{y_metric} vs {x_metric} by {color_dim}")
+        ax.legend(fontsize=8, markerscale=2)
+        chart_card(fig, f"Scatter of {len(cf)} customers colored by {color_dim}")
+    
+    elif chart_type == "Bar":
+        agg = cf.groupby(x_dim)[y_metric].mean().sort_values(ascending=False).head(20)
+        fig, ax = plt.subplots(figsize=(10, 5))
+        colors = [segment_color(idx) for idx in agg.index]
+        ax.bar(range(len(agg)), agg.values, color=colors)
+        ax.set_xticks(range(len(agg)))
+        ax.set_xticklabels([str(x)[:25] for x in agg.index], rotation=45, ha="right")
+        ax.set_ylabel(y_metric.replace("_", " ").title())
+        ax.set_title(f"Mean {y_metric} by {x_dim}")
+        chart_card(fig, f"Top {x_dim} by {y_metric}: {agg.index[0]} leads with {agg.iloc[0]:.1f}")
+    
+    elif chart_type == "Heatmap":
+        if len(numeric_cols) >= 2:
+            corr = cf[numeric_cols].corr()
+            fig, ax = plt.subplots(figsize=(10, 8))
+            im = ax.imshow(corr, cmap="RdBu_r", vmin=-1, vmax=1, aspect="auto")
+            ax.set_xticks(range(len(corr.columns)))
+            ax.set_xticklabels(corr.columns, rotation=45, ha="right", fontsize=8)
+            ax.set_yticks(range(len(corr.columns)))
+            ax.set_yticklabels(corr.columns, fontsize=8)
+            ax.set_title("Metric Correlation Heatmap")
+            fig.colorbar(im, ax=ax, label="Correlation")
+            chart_card(fig, "Correlation between numeric customer features")
+    
+    elif chart_type == "Box":
+        if "cluster_label" in cf.columns:
+            groups = sorted(cf["cluster_label"].dropna().unique())
+            data = [cf[cf["cluster_label"] == g][y_metric].dropna() for g in groups]
+            fig, ax = plt.subplots(figsize=(10, 5))
+            bp = ax.boxplot(data, tick_labels=[str(g)[:20] for g in groups], patch_artist=True, showfliers=False)
+            for patch, g in zip(bp["boxes"], groups):
+                patch.set_facecolor(segment_color(g))
+                patch.set_alpha(0.6)
+            ax.set_ylabel(y_metric.replace("_", " ").title())
+            ax.set_title(f"{y_metric} distribution by segment")
+            chart_card(fig, f"Segment {max(groups, key=lambda g: cf[cf['cluster_label']==g][y_metric].median())} has highest median {y_metric}")
+    
+    st.markdown("---")
+    
+    # Segment comparison
+    st.subheader("Segment Comparison")
     labels = sorted(cf["cluster_label"].dropna().unique()) if "cluster_label" in cf else []
     rfm = sorted(cf["rfm_segment"].dropna().unique()) if "rfm_segment" in cf else []
+    col1, col2 = st.columns(2)
+    seg_a = col1.selectbox("Segment A", labels, index=0 if labels else 0)
+    seg_b = col2.selectbox("Segment B", labels, index=1 if len(labels) > 1 else 0)
+    
+    if seg_a != seg_b:
+        metrics_to_compare = [c for c in numeric_cols if c in cf.columns][:10]
+        comp_a = cf[cf["cluster_label"] == seg_a][metrics_to_compare].mean()
+        comp_b = cf[cf["cluster_label"] == seg_b][metrics_to_compare].mean()
+        diff = ((comp_b - comp_a) / comp_a.replace(0, np.nan) * 100).round(1)
+        comp_df = pd.DataFrame({seg_a: comp_a.round(2), seg_b: comp_b.round(2), "Diff %": diff}).reset_index()
+        comp_df.columns = ["Metric", seg_a, seg_b, "Diff %"]
+        show_df(pretty(comp_df))
+    
+    st.markdown("---")
+    
+    # Existing filter and export
+    st.subheader("Filter & Export")
+    c1, c2, c3 = st.columns(3)
     sel_cl = c1.multiselect("Segment", labels, default=labels)
     sel_rfm = c2.multiselect("RFM group", rfm, default=rfm)
     lo, hi = c3.slider("P(alive) range", 0.0, 1.0, (0.0, 1.0), step=0.05)
@@ -489,6 +922,7 @@ def tab_explorer(R: dict[str, Any]) -> None:
     show_df(d[cols].head(1000) if cols else d.head(1000))
     st.download_button("Download filtered customers (CSV)", d[cols].to_csv(index=False).encode("utf-8") if cols else d.to_csv(index=False).encode("utf-8"),
                        file_name="filtered_customers.csv", mime="text/csv")
+    
     st.subheader("Customer lookup")
     q = st.text_input("Customer id")
     if q:
@@ -502,24 +936,35 @@ def tab_explorer(R: dict[str, Any]) -> None:
 def tab_data(R: dict[str, Any]) -> None:
     st.header("Data and downloads")
     st.caption("Question answered here: what is wrong with the data, and where are the files?")
+    
+    chart_data = load_chart_data(R["results"], CHARTS_BY_TAB["data"])
+    kpis = compute_kpis_from_tables(chart_data)
+    kpi_row(kpis)
+    
+    st.markdown("---")
+    
     show_charts(R, CHARTS_BY_TAB["data"])
+    
     q = table(R, "data_quality_issues")
     if len(q):
         st.subheader("All data-quality checks")
         show_df(pretty(q))
+    
     mv = table(R, "product_metadata_variants")
     if len(mv):
         with st.expander("Products with conflicting category or department"):
             show_df(pretty(mv))
+    
     st.subheader("Downloads")
-    c1, c2, c3 = st.columns(3)
-    c1.download_button("All result tables and charts (ZIP)", zip_dir(R["results"]), file_name="customer_insights_results.zip", mime="application/zip")
+    c1, c2, c3, c4 = st.columns(4)
+    c1.download_button("All result tables (ZIP)", zip_dir(R["results"]), file_name="customer_insights_tables.zip", mime="application/zip")
+    c2.download_button("All charts (ZIP)", zip_dir(R["insights"]), file_name="customer_insights_charts.zip", mime="application/zip")
     html_path = Path(R["insights"]) / "insights.html"
     if html_path.is_file():
-        c2.download_button("Dashboard (HTML)", html_path.read_bytes(), file_name="insights.html", mime="text/html")
+        c3.download_button("Dashboard (HTML)", html_path.read_bytes(), file_name="insights.html", mime="text/html")
     rp = Path(R["results"]) / "analysis_report.md"
     if rp.is_file():
-        c3.download_button("Written report (Markdown)", rp.read_bytes(), file_name="analysis_report.md", mime="text/markdown")
+        c4.download_button("Written report (Markdown)", rp.read_bytes(), file_name="analysis_report.md", mime="text/markdown")
 
 
 # --------------------------------------------------------------------------- #
