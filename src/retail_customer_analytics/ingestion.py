@@ -71,7 +71,10 @@ def parse_dates(raw: pd.Series, date_format: str | None) -> pd.Series:
     # Warn if any dates remain unparsed
     unparsed = out.isna() & raw.notna() & (raw != "")
     if unparsed.any():
-        LOGGER.warning("%d date values could not be parsed. Use --date-format to specify format.", unparsed.sum())
+        LOGGER.warning(
+            "%d date values could not be parsed. Use --date-format to specify format.",
+            unparsed.sum(),
+        )
 
     return out
 
@@ -81,7 +84,11 @@ def load_lines(path: Path, date_format: str | None) -> tuple[pd.DataFrame, dict[
     suffix = path.suffix.lower()
     if suffix == ".csv":
         raw = pd.read_csv(
-            path, dtype=str, keep_default_na=False, na_values=["", "NULL", "null"], encoding_errors="replace"
+            path,
+            dtype=str,
+            keep_default_na=False,
+            na_values=["", "NULL", "null"],
+            encoding_errors="replace",
         )
     elif suffix in {".parquet", ".pq"}:
         raw = pd.read_parquet(path)
@@ -105,7 +112,8 @@ def load_lines(path: Path, date_format: str | None) -> tuple[pd.DataFrame, dict[
 
     # Normalize numeric columns
     present = {
-        c: raw[c].notna() & (raw[c].astype("string").str.strip() != "") for c in ("transaction_date", "price", "quantity")
+        c: raw[c].notna() & (raw[c].astype("string").str.strip() != "")
+        for c in ("transaction_date", "price", "quantity")
     }
     for col in ("price", "quantity"):
         v = pd.to_numeric(raw[col], errors="coerce").astype(float)
@@ -136,11 +144,15 @@ def load_lines(path: Path, date_format: str | None) -> tuple[pd.DataFrame, dict[
         "negative_price_rows": int((df["price"] < 0).sum()),
         "zero_price_rows": int((df["price"] == 0).sum()),
         "missing_quantity_rows": int(df["quantity"].isna().sum()),
-        "invalid_quantity_conversion_rows": int((present["quantity"] & df["quantity"].isna()).sum()),
+        "invalid_quantity_conversion_rows": int(
+            (present["quantity"] & df["quantity"].isna()).sum()
+        ),
         "negative_quantity_return_rows": int((df["quantity"] < 0).sum()),
         "zero_quantity_rows": int((df["quantity"] == 0).sum()),
         "uncomputable_line_revenue_rows": int(df["line_revenue"].isna().sum()),
-        "exact_duplicate_excess_rows": int(df.duplicated(subset=REQUIRED_COLUMNS, keep="first").sum()),
+        "exact_duplicate_excess_rows": int(
+            df.duplicated(subset=REQUIRED_COLUMNS, keep="first").sum()
+        ),
         "ignored_extra_columns": extra,
     }
     return df, issues
@@ -148,7 +160,11 @@ def load_lines(path: Path, date_format: str | None) -> tuple[pd.DataFrame, dict[
 
 def clean_lines(df: pd.DataFrame, args: Any) -> tuple[pd.DataFrame, dict[str, int]]:
     """Apply cleaning rules based on CLI/app arguments."""
-    removed = {"exact_duplicate_rows_removed": 0, "zero_quantity_rows_removed": 0, "negative_price_rows_removed": 0}
+    removed = {
+        "exact_duplicate_rows_removed": 0,
+        "zero_quantity_rows_removed": 0,
+        "negative_price_rows_removed": 0,
+    }
 
     if getattr(args, "drop_exact_duplicates", False):
         n = len(df)
@@ -177,7 +193,9 @@ def structural_checks(df: pd.DataFrame) -> dict[str, int]:
         ),
         "customer_transaction_keys_spanning_multiple_days": int(
             (
-                df[ok & df["transaction_day"].notna()].groupby(["customer_id", "transaction_id"])["transaction_day"].nunique()
+                df[ok & df["transaction_day"].notna()]
+                .groupby(["customer_id", "transaction_id"])["transaction_day"]
+                .nunique()
                 > 1
             ).sum()
         ),
@@ -212,11 +230,15 @@ def prepare_transaction_frame(df: pd.DataFrame, date_format: str | None = None) 
     df, _ = load_lines_from_dataframe(df, date_format)
 
     # Apply standard cleaning (no CLI flags in app)
-    args = type("Args", (), {
-        "drop_exact_duplicates": False,
-        "exclude_zero_quantity": True,  # App drops zero quantity
-        "exclude_negative_prices": False,
-    })()
+    args = type(
+        "Args",
+        (),
+        {
+            "drop_exact_duplicates": False,
+            "exclude_zero_quantity": True,  # App drops zero quantity
+            "exclude_negative_prices": False,
+        },
+    )()
     df, _ = clean_lines(df, args)
 
     # Calculate revenue
@@ -225,7 +247,9 @@ def prepare_transaction_frame(df: pd.DataFrame, date_format: str | None = None) 
     return df
 
 
-def load_lines_from_dataframe(raw: pd.DataFrame, date_format: str | None) -> tuple[pd.DataFrame, dict[str, Any]]:
+def load_lines_from_dataframe(
+    raw: pd.DataFrame, date_format: str | None
+) -> tuple[pd.DataFrame, dict[str, Any]]:
     """Load lines from an already-loaded DataFrame (for Streamlit app)."""
     # Ensure we only use canonical columns
     extra = sorted(set(raw.columns) - set(REQUIRED_COLUMNS))
@@ -239,7 +263,8 @@ def load_lines_from_dataframe(raw: pd.DataFrame, date_format: str | None) -> tup
         df[col] = s.astype(object).where(s.notna(), None)
 
     present = {
-        c: raw[c].notna() & (raw[c].astype("string").str.strip() != "") for c in ("transaction_date", "price", "quantity")
+        c: raw[c].notna() & (raw[c].astype("string").str.strip() != "")
+        for c in ("transaction_date", "price", "quantity")
     }
     for col in ("price", "quantity"):
         v = pd.to_numeric(raw[col], errors="coerce").astype(float)
@@ -267,11 +292,15 @@ def load_lines_from_dataframe(raw: pd.DataFrame, date_format: str | None) -> tup
         "negative_price_rows": int((df["price"] < 0).sum()),
         "zero_price_rows": int((df["price"] == 0).sum()),
         "missing_quantity_rows": int(df["quantity"].isna().sum()),
-        "invalid_quantity_conversion_rows": int((present["quantity"] & df["quantity"].isna()).sum()),
+        "invalid_quantity_conversion_rows": int(
+            (present["quantity"] & df["quantity"].isna()).sum()
+        ),
         "negative_quantity_return_rows": int((df["quantity"] < 0).sum()),
         "zero_quantity_rows": int((df["quantity"] == 0).sum()),
         "uncomputable_line_revenue_rows": int(df["line_revenue"].isna().sum()),
-        "exact_duplicate_excess_rows": int(df.duplicated(subset=REQUIRED_COLUMNS, keep="first").sum()),
+        "exact_duplicate_excess_rows": int(
+            df.duplicated(subset=REQUIRED_COLUMNS, keep="first").sum()
+        ),
         "ignored_extra_columns": extra,
     }
     return df, issues
@@ -285,20 +314,20 @@ def fmt_currency(v: float, currency: str = DEFAULT_CURRENCY) -> str:
     """Format currency value with explicit currency symbol."""
     symbol = CURRENCY_SYMBOLS.get(currency.upper(), currency)
     if v >= 1e9:
-        return f"{symbol}{v/1e9:.1f}B"
+        return f"{symbol}{v / 1e9:.1f}B"
     elif v >= 1e6:
-        return f"{symbol}{v/1e6:.1f}M"
+        return f"{symbol}{v / 1e6:.1f}M"
     elif v >= 1e3:
-        return f"{symbol}{v/1e3:.1f}K"
+        return f"{symbol}{v / 1e3:.1f}K"
     else:
         return f"{symbol}{v:,.0f}"
 
 
 def fmt_number(v: float) -> str:
     if v >= 1e6:
-        return f"{v/1e6:.1f}M"
+        return f"{v / 1e6:.1f}M"
     elif v >= 1e3:
-        return f"{v/1e3:.1f}K"
+        return f"{v / 1e3:.1f}K"
     else:
         return f"{v:,.0f}"
 

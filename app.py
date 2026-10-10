@@ -65,16 +65,24 @@ APP_DIR = Path(__file__).resolve().parent
 if str(APP_DIR) not in sys.path:
     sys.path.insert(0, str(APP_DIR))
 sys.path.insert(0, str(APP_DIR / "src"))
-from retail_customer_analytics.ingestion import (  # ruff: noqa: E402
+
+# ruff: noqa: E402
+from retail_customer_analytics.ingestion import (
     fmt_currency,
     fmt_number,
     fmt_pct,
+)
+from retail_customer_analytics.ingestion import (
     prepare_transaction_frame as canonical_prepare_transaction_frame,
 )
-from retail_customer_analytics.metrics import (  # ruff: noqa: E402
+
+# ruff: noqa: E402
+from retail_customer_analytics.metrics import (
     compute_period_metrics,
 )
-from retail_customer_analytics.period_manager import (  # ruff: noqa: E402
+
+# ruff: noqa: E402
+from retail_customer_analytics.period_manager import (
     compute_preset_date_range,
     ensure_not_empty,
     get_period_context,
@@ -1235,13 +1243,18 @@ def build_customer_features(
 
     cust["segment_rfm"] = cust.apply(assign_rfm_segment, axis=1)
 
-    # Value tier (percentile-based)
-    cust["segment_value_tier"] = pd.qcut(
-        cust["txn_monetary"].rank(method="first"),
-        q=[0, 0.01, 0.05, 0.10, 0.20, 0.70, 1.0],
-        labels=["Top 1%", "Next 4%", "Next 5%", "Next 10%", "Middle 50%", "Bottom 30%"],
-        duplicates="drop",
-    )
+    # Value tier (percentile-based) - handle case where all values are the same
+    monetary_ranked = cust["txn_monetary"].rank(method="first")
+    if monetary_ranked.nunique() > 1:
+        cust["segment_value_tier"] = pd.qcut(
+            monetary_ranked,
+            q=[0, 0.01, 0.05, 0.10, 0.20, 0.70, 1.0],
+            labels=["Top 1%", "Next 4%", "Next 5%", "Next 10%", "Middle 50%", "Bottom 30%"],
+            duplicates="drop",
+        )
+    else:
+        # All customers have same monetary value - assign middle tier
+        cust["segment_value_tier"] = "Middle 50%"
 
     # Lifecycle classification
     cust = classify_customer_lifecycle(cust, analysis_end_date, inactivity_window_days)
@@ -2108,7 +2121,8 @@ def plot_rfm_segments(rfm: pd.DataFrame) -> tuple:
     )
     axes[0].set_yticks(range(len(seg_summary)))
     axes[0].set_yticklabels(
-        [f"{s} ({c:,})" for s, c in zip(seg_summary.index, seg_summary["customers"], strict=False)], fontsize=9
+        [f"{s} ({c:,})" for s, c in zip(seg_summary.index, seg_summary["customers"], strict=False)],
+        fontsize=9,
     )
     axes[0].set_xlabel("Revenue", fontsize=10)
     axes[0].set_title("Revenue by RFM Segment", fontsize=12, fontweight="bold")
@@ -2225,16 +2239,17 @@ def plot_pareto(
     fig, ax1 = plt.subplots(figsize=(12, 5))
 
     # Bar chart
-    ax1.bar(
-        range(len(pareto)), pareto[value_col], color="#2b6cb0", edgecolor="white", width=0.7
-    )
+    ax1.bar(range(len(pareto)), pareto[value_col], color="#2b6cb0", edgecolor="white", width=0.7)
     ax1.set_ylabel(value_col.replace("_", " ").title(), fontsize=10, color="#2b6cb0")
     ax1.tick_params(axis="y", labelcolor="#2b6cb0")
 
     # Labels
     ax1.set_xticks(range(len(pareto)))
     ax1.set_xticklabels(
-        [str(label_val)[:20] for label_val in pareto[label_col]], rotation=45, ha="right", fontsize=8
+        [str(label_val)[:20] for label_val in pareto[label_col]],
+        rotation=45,
+        ha="right",
+        fontsize=8,
     )
 
     # Cumulative line - shows share of TOTAL business
@@ -3421,7 +3436,10 @@ def _plot_yoy_comparison(raw_df: pd.DataFrame, period_params: dict) -> tuple | N
                     fontweight="bold",
                     color="#2f855a" if growth >= 0 else "#e53e3e",
                     bbox={
-                        "boxstyle": "round,pad=0.3", "facecolor": "white", "edgecolor": "gray", "alpha": 0.9
+                        "boxstyle": "round,pad=0.3",
+                        "facecolor": "white",
+                        "edgecolor": "gray",
+                        "alpha": 0.9,
                     },
                 )
 
@@ -4934,10 +4952,13 @@ def _plot_product_quadrant_from_features(prod_features: pd.DataFrame) -> tuple |
         fig, ax = plt.subplots(figsize=(10, 7))
 
         # Color by department
-        dept_colors = dict(zip(
+        dept_colors = dict(
+            zip(
                 top_prods["department"].unique(),
-                ["#2b6cb0", "#2f855a", "#dd6b20", "#6b46c1", "#975a16", "#d53f8c"], strict=False,
-            ))
+                ["#2b6cb0", "#2f855a", "#dd6b20", "#6b46c1", "#975a16", "#d53f8c"],
+                strict=False,
+            )
+        )
 
         for dept in top_prods["department"].unique():
             dept_data = top_prods[top_prods["department"] == dept]
@@ -5772,9 +5793,7 @@ def _plot_anomaly_timeseries(anomaly_data: dict, metric: str) -> tuple | None:
 
         # Highlight current period
         if current_start and current_end:
-            (daily["transaction_day"] >= current_start) & (
-                daily["transaction_day"] <= current_end
-            )
+            (daily["transaction_day"] >= current_start) & (daily["transaction_day"] <= current_end)
             ax.axvspan(
                 current_start, current_end, alpha=0.1, color="yellow", label="Current Period"
             )
@@ -6274,188 +6293,6 @@ def _plot_drilldown_path(
         return fig, ax
     except Exception:
         return None
-    """RFM Analysis tab with customer segmentation, value concentration, and action recommendations."""
-    st.header("6 RFM Analysis")
-    st.caption(
-        "Question answered here: which customers are champions, at risk, or need attention? How concentrated is revenue?"
-    )
-
-    cf = table(R, "customer_features")
-    if cf.empty:
-        st.info("No customer features available.")
-        return
-
-    # Compute RFM from raw data using canonical build_customer_features
-    if raw_df is not None and period_params:
-        analysis_date = period_params["current_end"]
-        with st.spinner("Computing RFM segmentation..."):
-            cust_features = build_customer_features(raw_df, analysis_date)
-            # Map canonical column names to expected plot_rfm_segments format
-            rfm = cust_features.rename(
-                columns={
-                    "customer_id": "customer_id",
-                    "txn_recency_days": "recency_days",
-                    "txn_frequency": "frequency",
-                    "txn_monetary": "monetary",
-                    "segment_rfm": "segment",
-                }
-            )
-    else:
-        # Use existing customer_features if it has RFM columns
-        if "segment_rfm" in cf.columns:
-            st.info("Using pre-computed RFM from canonical customer features.")
-            rfm = cf.rename(
-                columns={
-                    "txn_recency_days": "recency_days",
-                    "txn_frequency": "frequency",
-                    "txn_monetary": "monetary",
-                    "segment_rfm": "segment",
-                }
-            )
-        elif "rfm_segment" in cf.columns:
-            st.info("Using pre-computed RFM from analysis pipeline.")
-            rfm = cf.copy()
-            rfm["segment"] = cf["rfm_segment"]
-        else:
-            st.warning("RFM requires raw transaction data. Run analysis with raw data available.")
-            return
-
-    # === RFM Segments Visualization ===
-    st.subheader("RFM Segments")
-    fig, axes = plot_rfm_segments(rfm)
-    chart_card(
-        fig,
-        f"Identified {rfm['segment'].nunique()} RFM segments. Champions represent {rfm[rfm['segment'] == 'Champions']['monetary'].sum() / rfm['monetary'].sum() * 100:.0f}% of revenue."
-        if "monetary" in rfm.columns
-        else "RFM segmentation complete.",
-        scope="As of analysis date · Recency/Frequency/Monetary quintiles · Tie-safe scoring",
-    )
-
-    # Segment summary table
-    st.markdown("---")
-    st.subheader("Segment Summary")
-    seg_summary = (
-        rfm.groupby("segment")
-        .agg(
-            customers=("customer_id", "count"),
-            revenue=("monetary", "sum") if "monetary" in rfm.columns else ("customer_id", "count"),
-            avg_recency=("recency_days", "mean")
-            if "recency_days" in rfm.columns
-            else ("customer_id", "count"),
-            avg_frequency=("frequency", "mean")
-            if "frequency" in rfm.columns
-            else ("customer_id", "count"),
-            avg_monetary=("monetary", "mean")
-            if "monetary" in rfm.columns
-            else ("customer_id", "count"),
-        )
-        .sort_values("revenue", ascending=False)
-        .reset_index()
-    )
-
-    display_cols = ["segment", "customers"]
-    if "revenue" in seg_summary.columns:
-        display_cols.append("revenue")
-    if "avg_recency" in seg_summary.columns:
-        display_cols.extend(["avg_recency", "avg_frequency", "avg_monetary"])
-
-    show_df(pretty(seg_summary[display_cols]))
-
-    # === Customer Value Concentration (Pareto & Lorenz) ===
-    if "monetary" in rfm.columns:
-        st.markdown("---")
-        st.subheader("Customer Value Concentration")
-
-        col1, col2 = st.columns(2)
-        with col1:
-            st.markdown("**Pareto: Top Customers by Lifetime Revenue**")
-            pareto_fig = _plot_customer_pareto(rfm)
-            if pareto_fig:
-                chart_card(
-                    pareto_fig[0],
-                    "Shows how much revenue is concentrated in top customers. 80% threshold indicates Pareto principle.",
-                    scope="Full observed history · Lifetime revenue (net_spend) · Exclusive tier labels",
-                )
-
-        with col2:
-            st.markdown("**Lorenz Curve: Revenue Inequality**")
-            lorenz_fig = _plot_customer_lorenz(rfm)
-            if lorenz_fig:
-                chart_card(
-                    lorenz_fig[0],
-                    "Area between curve and diagonal = revenue concentration. Gini coefficient quantifies inequality.",
-                    scope="Full observed history · Lifetime revenue (net_spend) · Excludes non-positive monetary",
-                )
-
-        # Value tiers
-        st.markdown("---")
-        st.markdown("**Value Tier Breakdown**")
-        tiers_fig = _plot_customer_value_tiers(rfm)
-        if tiers_fig:
-            chart_card(
-                tiers_fig[0],
-                "Compares customer count share vs revenue share by value tier (exclusive bands).",
-                scope="Full observed history · Lifetime revenue (net_spend) · Exclusive bands: Top 1%, Next 4%, Next 5%, Next 10%, Middle 50%, Bottom 30%",
-            )
-
-        # Concentration table
-        st.markdown("**Concentration Summary**")
-        n = len(rfm)
-        rfm_sorted = rfm.sort_values("monetary", ascending=False).reset_index(drop=True)
-        rfm_sorted["cum_revenue_pct"] = (
-            rfm_sorted["monetary"].cumsum() / rfm_sorted["monetary"].sum() * 100
-        )
-        rfm_sorted["cum_customer_pct"] = np.arange(1, n + 1) / n * 100
-
-        # Exclusive bands with correct labels
-        tiers = [
-            ("Top 1%", 0, 1),
-            ("Next 4%", 1, 5),
-            ("Next 5%", 5, 10),
-            ("Next 10%", 10, 20),
-            ("Middle 50%", 20, 70),
-            ("Bottom 30%", 70, 100),
-        ]
-
-        tier_data = []
-        for label, pct_start, pct_end in tiers:
-            start_idx = int(n * pct_start / 100)
-            end_idx = int(n * pct_end / 100)
-            tier_customers = rfm_sorted.iloc[start_idx:end_idx]
-            if len(tier_customers) == 0:
-                continue
-            tier_data.append(
-                {
-                    "Tier": label,
-                    "Customers": len(tier_customers),
-                    "Customer %": f"{len(tier_customers) / n * 100:.1f}%",
-                    "Revenue": fmt_currency(tier_customers["monetary"].sum()),
-                    "Revenue %": f"{tier_customers['monetary'].sum() / rfm['monetary'].sum() * 100:.1f}%",
-                    "Avg Revenue/Cust": fmt_currency(tier_customers["monetary"].mean()),
-                }
-            )
-
-        tier_df = pd.DataFrame(tier_data)
-        show_df(pretty(tier_df))
-
-    # Action recommendations
-    st.markdown("---")
-    st.subheader("Recommended Actions by Segment")
-    action_map = {
-        "Champions": "🟢 **Protect & Grow** - VIP treatment, early access, loyalty rewards",
-        "Loyal Customers": "🔵 **Cross-sell** - Bundle complementary categories, increase basket size",
-        "Potential Loyalists": "🟡 **Nurture** - Targeted offers to increase frequency",
-        "New Customers": "🟠 **Onboard** - Welcome series, second purchase incentives",
-        "At Risk High Value": "🔴 **Win-back** - Personal outreach, special offers",
-        "At Risk": "🔴 **Reactivate** - Win-back campaigns, feedback surveys",
-        "Hibernating": "⚪ **Low-cost reactivation** - Email reminders, small discounts",
-        "Needs Attention": "⚪ **Diagnose** - Analyze behavior patterns, test interventions",
-    }
-
-    for seg, action in action_map.items():
-        count = len(rfm[rfm["segment"] == seg]) if seg in rfm["segment"].values else 0
-        if count > 0:
-            st.markdown(f"**{seg}** ({count:,} customers): {action}")
 
 
 def tab_cohort(

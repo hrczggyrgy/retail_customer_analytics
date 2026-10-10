@@ -65,9 +65,7 @@ def filter_by_date_range(
     if df is None:
         return pl.DataFrame()
 
-    return df.filter(
-        (pl.col(date_col) >= start_date) & (pl.col(date_col) <= end_date)
-    )
+    return df.filter((pl.col(date_col) >= start_date) & (pl.col(date_col) <= end_date))
 
 
 def compute_period_metrics_pl(
