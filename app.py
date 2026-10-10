@@ -2036,6 +2036,10 @@ def plot_rfm_segments(rfm: pd.DataFrame) -> tuple:
     ax = axes[1]
     for seg in rfm["segment"].unique():
         s = rfm[rfm["segment"] == seg]
+        # Drop rows with NaN in required columns to ensure same-size arrays
+        s = s.dropna(subset=["recency_days", "monetary", "frequency"])
+        if len(s) == 0:
+            continue
         ax.scatter(
             s["recency_days"],
             s["monetary"],
