@@ -1413,15 +1413,27 @@ def _pair_stats(n_ab: np.ndarray, n_a: np.ndarray, n_b: np.ndarray, n: int) -> d
 
 
 def basket_affinity(lines: pd.DataFrame, as_of: pd.Timestamp, args: argparse.Namespace) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, Any]]:
-    """Customer-level association tests on trips (customer-day baskets) plus next-trip transitions."""
+    """Customer-level association tests on baskets (trip or transaction grain per --frequency-grain) plus next-trip transitions.
+    
+    When frequency_grain='trip' (default), baskets are customer-day shopping occasions.
+    When frequency_grain='transaction', baskets are individual transaction_ids.
+    """
     item_col = "category" if args.basket_level == "category" else "product_id"
-    det: dict[str, Any] = {"status": "skipped", "reason": None, "basket_level": args.basket_level}
+    det: dict[str, Any] = {"status": "skipped", "reason": None, "basket_level": args.basket_level, "basket_grain": args.frequency_grain}
     base = lines[(lines["quantity"] > 0) & lines["customer_id"].notna() & lines["transaction_day"].notna() & lines[item_col].notna()
-                 & (lines["transaction_day"] <= as_of)][["customer_id", "transaction_day", item_col]].drop_duplicates()
+                 & (lines["transaction_day"] <= as_of)]
+    # Apply frequency grain: trip = customer-day, transaction = (customer_id, transaction_id)
+    if args.frequency_grain == "trip":
+        base = base[["customer_id", "transaction_day", item_col]].drop_duplicates()
+        basket_key = ["customer_id", "transaction_day"]
+    else:  # transaction grain
+        base = base[base["transaction_id"].notna()][["customer_id", "transaction_id", "transaction_day", item_col]].drop_duplicates()
+        basket_key = ["customer_id", "transaction_id"]
+    
     if base.empty:
         det["reason"] = "no identifiable positive-purchase baskets"
         return pd.DataFrame(), pd.DataFrame(), det
-    n_b = base.groupby("customer_id")["transaction_day"].nunique()
+    n_b = base.groupby("customer_id")[basket_key[1]].nunique()
     det["eligible_customers"], det["eligible_baskets"] = int(len(n_b)), int(n_b.sum())
     h = pd.Series(_hash_series(pd.Series(n_b.index), args.random_seed), index=n_b.index)
     keep = n_b.loc[h.sort_values().index].cumsum() <= args.max_affinity_baskets
@@ -1433,8 +1445,8 @@ def basket_affinity(lines: pd.DataFrame, as_of: pd.Timestamp, args: argparse.Nam
     pop = base.groupby(item_col)["customer_id"].nunique().sort_values(ascending=False).head(args.max_affinity_items)
     rank, names = {k: i for i, k in enumerate(pop.index)}, list(pop.index)
     base = base[base[item_col].isin(rank)].assign(ix=lambda d: d[item_col].map(rank))
-    baskets = (base.groupby(["customer_id", "transaction_day"])["ix"].agg(lambda s: sorted(set(s))[: args.max_items_per_basket])
-               .reset_index().sort_values(["customer_id", "transaction_day"]))
+    baskets = (base.groupby(["customer_id", basket_key[1]])["ix"].agg(lambda s: sorted(set(s))[: args.max_items_per_basket])
+               .reset_index().sort_values(["customer_id", basket_key[1]]))
     half = {cid: int(v & np.uint64(1)) for cid, v in zip(h.index, h.to_numpy())}
     item_b, pair_b = Counter(), Counter()
     item_c, pair_c, n_c = [Counter(), Counter()], [Counter(), Counter()], [0, 0]

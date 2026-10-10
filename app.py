@@ -1049,6 +1049,8 @@ def ensure_not_empty(df: pd.DataFrame, context: str = "") -> bool:
 # ============================================================
 # Customer Analytics - Canonical Feature Builder (Phase 3)
 # ============================================================
+# This is now a thin wrapper around the canonical builder in features.py
+# to maintain API compatibility with existing app code.
 def build_customer_features(
     transactions: pd.DataFrame,
     analysis_end_date: pd.Timestamp,
@@ -1057,8 +1059,11 @@ def build_customer_features(
     """
     Build one canonical row per customer from transaction history.
     
+    This wraps the canonical builder from retail_customer_analytics.features
+    and adds app-specific transformations (RFM segments, lifecycle, txn_ prefix).
+    
     Business rules:
-        - Frequency is the number of distinct invoices (transaction_id).
+        - Frequency is the number of distinct invoices (transaction_id) - uses transaction grain.
         - Monetary value is observed historical revenue (positive quantity only).
         - Recency is days since last purchase as of analysis_end_date.
         - Tenure is days between first and last purchase.
@@ -1073,35 +1078,54 @@ def build_customer_features(
         DataFrame with one row per customer, columns prefixed:
         - txn_: Transaction-derived (observed) fields
         - lifecycle_: Lifecycle status fields
+        - segment_rfm: RFM segment label
     
     Does not include:
         Model-derived fields (p_alive, expected_revenue, etc.) - those come from pipeline.
     """
-    # Filter to analysis date and positive purchases only
-    df = transactions[
-        (transactions["transaction_day"] <= analysis_end_date) & 
-        (transactions["quantity"] > 0)
-    ].copy()
+    # Use canonical builder with transaction grain to match app's invoice-level frequency
+    from retail_customer_analytics.features import build_customer_snapshot
     
-    if df.empty:
+    # Canonical builder expects 'transaction_day' column and returns customer_id as index
+    cust = build_customer_snapshot(
+        transactions=transactions,
+        as_of=analysis_end_date,
+        event_grain="transaction",  # App uses invoice-level frequency
+        windows_days=(30, 90, 365),
+        recent_window_days=inactivity_window_days,
+    )
+    
+    if cust.empty:
         return pd.DataFrame()
     
-    # Customer-level aggregation
-    cust = df.groupby("customer_id").agg(
-        txn_first_purchase=("transaction_day", "min"),
-        txn_last_purchase=("transaction_day", "max"),
-        txn_frequency=("transaction_id", "nunique"),
-        txn_monetary=("revenue", "sum"),
-        txn_total_quantity=("quantity", "sum"),
-        txn_distinct_products=("product_id", "nunique"),
-        txn_distinct_categories=("category", "nunique"),
-        txn_distinct_departments=("department", "nunique"),
-    ).reset_index()
+    # Transform canonical columns to app's expected txn_ prefixed columns
+    cust = cust.reset_index()
     
-    # Recency and tenure
-    cust["txn_recency_days"] = (analysis_end_date - cust["txn_last_purchase"]).dt.days
-    cust["txn_tenure_days"] = (cust["txn_last_purchase"] - cust["txn_first_purchase"]).dt.days
-    cust["txn_aov"] = cust["txn_monetary"] / cust["txn_frequency"].replace(0, np.nan)
+    # Map columns
+    column_map = {
+        "customer_id": "customer_id",
+        "n_trips": "txn_frequency",
+        "gross_spend": "txn_monetary",
+        "recency_days": "txn_recency_days",
+        "first_day": "txn_first_purchase",
+        "last_day": "txn_last_purchase",
+        "mean_trip_value": "txn_aov",
+        "n_products": "txn_distinct_products",  # Note: this is per-trip avg, not lifetime
+        "unique_products_purchased": "txn_distinct_products",
+        "unique_categories_purchased": "txn_distinct_categories",
+        "unique_departments_purchased": "txn_distinct_departments",
+        "top_category_by_spend": "top_category_by_spend",
+        "top_department_by_spend": "top_department_by_spend",
+    }
+    
+    # Rename existing columns
+    for old, new in column_map.items():
+        if old in cust.columns:
+            cust[new] = cust[old]
+    
+    # Compute tenure
+    if "txn_first_purchase" in cust.columns and "txn_last_purchase" in cust.columns:
+        cust["txn_tenure_days"] = (cust["txn_last_purchase"] - cust["txn_first_purchase"]).dt.days
     
     # RFM Scoring (quintiles 1-5, 5 is best) - TIE-SAFE
     def safe_qcut_score(series, q=5, reverse=False):
