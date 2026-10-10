@@ -5,15 +5,33 @@ test_final/
 sample_data.csv
 sample_data.parquet
 
+# Generated artifacts
+*.parquet
+*.csv
+*.png
+*.jpg
+*.pdf
+
 # Python
 __pycache__/
 *.py[cod]
 *$py.class
+.mypy_cache/
+.pytest_cache/
+.coverage/
+htmlcov/
+.tox/
+build/
+dist/
+*.egg-info/
 
 # Environment
 .env
 .venv
 venv/
+
+# Streamlit
+.streamlit/secrets.toml
 
 # IDE
 .vscode/
