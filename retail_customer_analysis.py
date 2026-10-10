@@ -87,6 +87,20 @@ from retail_customer_analytics.ingestion import (
     load_lines,
     structural_checks,
 )
+from retail_customer_analytics.events import (
+    EventConfig,
+    build_purchase_events,
+    match_returns,
+    add_price_index,
+)
+from retail_customer_analytics.affinity import (
+    AffinityConfig,
+    analyze_affinity,
+)
+from retail_customer_analytics.features import (
+    build_customer_snapshot,
+    validate_feature_contract,
+)
 
 LOGGER = logging.getLogger("retail_analysis")
 RFM_LABELS = [
@@ -273,39 +287,12 @@ def validate_args(a: argparse.Namespace, p: argparse.ArgumentParser) -> None:
 # --------------------------------------------------------------------------- #
 def build_trips(lines: pd.DataFrame, grain: str = "trip") -> pd.DataFrame:
     """Purchase events per customer. grain='trip': one row per customer-day (split receipts merged);
-    grain='transaction': one row per (customer_id, transaction_id), dated at its earliest line."""
-    cols = ["customer_id", "transaction_day", "trip_value", "n_lines", "n_products", "n_units"]
-    if grain == "transaction":
-        cols = [
-            "customer_id",
-            "transaction_id",
-            "transaction_day",
-            "trip_value",
-            "n_lines",
-            "n_products",
-            "n_units",
-        ]
-    buys = lines[
-        (lines["quantity"] > 0) & lines["customer_id"].notna() & lines["transaction_day"].notna()
-    ]
-    if grain == "transaction":
-        buys = buys[buys["transaction_id"].notna()]
-    if buys.empty:
-        return pd.DataFrame(columns=cols)
-    buys = buys.assign(rev_pos=buys["line_revenue"].clip(lower=0).fillna(0.0))
-    keys = (
-        ["customer_id", "transaction_day"] if grain == "trip" else ["customer_id", "transaction_id"]
-    )
-    spec = {
-        "trip_value": ("rev_pos", "sum"),
-        "n_lines": ("quantity", "size"),
-        "n_products": ("product_id", "nunique"),
-        "n_units": ("quantity", "sum"),
-    }
-    if grain == "transaction":
-        spec["transaction_day"] = ("transaction_day", "min")
-    trips = buys.groupby(keys, sort=False).agg(**spec).reset_index()
-    return trips[trips["trip_value"] > 0][cols].reset_index(drop=True)
+    grain='transaction': one row per (customer_id, transaction_id), dated at its earliest line.
+
+    This is a compatibility wrapper around the canonical event builder in events.py.
+    """
+    event_config = EventConfig(basket_grain=grain)
+    return build_purchase_events(lines, lines["transaction_day"].max(), event_config)
 
 
 def match_returns(lines: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, Any]]:
@@ -1935,233 +1922,45 @@ def accounting_check(lines: pd.DataFrame, summaries: dict[str, pd.DataFrame]) ->
 # --------------------------------------------------------------------------- #
 # Basket affinity with inference
 # --------------------------------------------------------------------------- #
-def benjamini_hochberg(p: np.ndarray) -> np.ndarray:
-    n = len(p)
-    if n == 0:
-        return p
-    order = np.argsort(p)
-    q = np.minimum.accumulate((p[order] * n / np.arange(1, n + 1))[::-1])[::-1]
-    out = np.empty(n)
-    out[order] = np.clip(q, 0, 1)
-    return out
-
-
-def _hash_series(values: pd.Series, seed: int) -> np.ndarray:
-    return pd.util.hash_pandas_object(values.astype(str), index=False).to_numpy(
-        dtype="uint64"
-    ) ^ np.uint64(seed * 2654435761 % (2**63))
-
-
-def _pair_stats(
-    n_ab: np.ndarray, n_a: np.ndarray, n_b: np.ndarray, n: int
-) -> dict[str, np.ndarray]:
-    """Lift, hypergeometric p-value and a Woolf odds-ratio CI (Haldane-corrected) from 2x2 counts."""
-    a, b, c, d = n_ab, n_a - n_ab, n_b - n_ab, n - n_a - n_b + n_ab
-    with np.errstate(divide="ignore", invalid="ignore"):
-        lift = n_ab * n / (n_a * n_b)
-        a2, b2, c2, d2 = (v + 0.5 for v in (a, b, c, d))
-        log_or = np.log(a2 * d2 / (b2 * c2))
-        se = np.sqrt(1 / a2 + 1 / b2 + 1 / c2 + 1 / d2)
-    return {
-        "lift": lift,
-        "or_ci95_lower": np.exp(log_or - 1.96 * se),
-        "odds_ratio": np.exp(log_or),
-        "p_value": stats.hypergeom.sf(n_ab - 1, n, n_a, n_b),
-    }
-
-
 def basket_affinity(
     lines: pd.DataFrame, as_of: pd.Timestamp, args: argparse.Namespace
 ) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, Any]]:
     """Customer-level association tests on baskets (trip or transaction grain per --frequency-grain) plus next-trip transitions.
 
-    When frequency_grain='trip' (default), baskets are customer-day shopping occasions.
-    When frequency_grain='transaction', baskets are individual transaction_ids.
+    This is a wrapper around the shared affinity engine in retail_customer_analytics.affinity.
     """
-    item_col = "category" if args.basket_level == "category" else "product_id"
-    det: dict[str, Any] = {
-        "status": "skipped",
-        "reason": None,
-        "basket_level": args.basket_level,
-        "basket_grain": args.frequency_grain,
-    }
-    base = lines[
-        (lines["quantity"] > 0)
-        & lines["customer_id"].notna()
-        & lines["transaction_day"].notna()
-        & lines[item_col].notna()
-        & (lines["transaction_day"] <= as_of)
-    ]
-    # Apply frequency grain: trip = customer-day, transaction = (customer_id, transaction_id)
-    if args.frequency_grain == "trip":
-        base = base[["customer_id", "transaction_day", item_col]].drop_duplicates()
-        basket_key = ["customer_id", "transaction_day"]
-    else:  # transaction grain
-        base = base[base["transaction_id"].notna()][
-            ["customer_id", "transaction_id", "transaction_day", item_col]
-        ].drop_duplicates()
-        basket_key = ["customer_id", "transaction_id"]
+    # Map transaction key mode from args
+    transaction_key_mode = getattr(args, "transaction_key_mode", "customer-transaction")
 
-    if base.empty:
-        det["reason"] = "no identifiable positive-purchase baskets"
-        return pd.DataFrame(), pd.DataFrame(), det
-    n_b = base.groupby("customer_id")[basket_key[1]].nunique()
-    det["eligible_customers"], det["eligible_baskets"] = int(len(n_b)), int(n_b.sum())
-    h = pd.Series(_hash_series(pd.Series(n_b.index), args.random_seed), index=n_b.index)
-    keep = n_b.loc[h.sort_values().index].cumsum() <= args.max_affinity_baskets
-    keep_ids = keep[keep].index
-    if len(keep_ids) < 30:
-        det["reason"] = "fewer than 30 customers within the basket budget"
-        return pd.DataFrame(), pd.DataFrame(), det
-    base = base[base["customer_id"].isin(keep_ids)]
-    pop = (
-        base.groupby(item_col)["customer_id"]
-        .nunique()
-        .sort_values(ascending=False)
-        .head(args.max_affinity_items)
+    config = AffinityConfig(
+        basket_level=args.basket_level,
+        basket_grain=args.frequency_grain,
+        transaction_key_mode=transaction_key_mode,
+        min_support=args.min_support,
+        min_confidence=args.min_confidence,
+        min_lift=args.min_lift,
+        fdr_alpha=args.fdr_alpha,
+        max_candidates=args.max_affinity_items,
+        max_baskets=args.max_affinity_baskets,
+        max_items_per_basket=args.max_items_per_basket,
+        max_pair_operations=args.max_affinity_pair_operations,
+        random_seed=args.random_seed,
     )
-    rank, names = {k: i for i, k in enumerate(pop.index)}, list(pop.index)
-    base = base[base[item_col].isin(rank)].assign(ix=lambda d: d[item_col].map(rank))
-    baskets = (
-        base.groupby(["customer_id", basket_key[1]])["ix"]
-        .agg(lambda s: sorted(set(s))[: args.max_items_per_basket])
-        .reset_index()
-        .sort_values(["customer_id", basket_key[1]])
-    )
-    half = {cid: int(v & np.uint64(1)) for cid, v in zip(h.index, h.to_numpy(), strict=False)}
-    item_b, pair_b = Counter(), Counter()
-    item_c, pair_c, n_c = [Counter(), Counter()], [Counter(), Counter()], [0, 0]
-    nxt_pair, nxt_from, nxt_to, n_trans = Counter(), Counter(), Counter(), 0
-    ops, n_baskets, n_customers = 0, 0, 0
-    for cid, grp in baskets.groupby("customer_id", sort=False):
-        cost = sum(len(s) * (len(s) - 1) // 2 for s in grp["ix"])
-        if ops + cost > args.max_affinity_pair_operations:
-            break
-        ops += cost
-        hh = half[cid]
-        c_items, c_pairs, prev = set(), set(), None
-        for items in grp["ix"]:
-            n_baskets += 1
-            item_b.update(items)
-            pairs = list(combinations(items, 2))
-            pair_b.update(pairs)
-            c_items.update(items)
-            c_pairs.update(pairs)
-            if prev is not None:
-                n_trans += 1
-                nxt_from.update(prev)
-                nxt_to.update(items)
-                nxt_pair.update((a_, b_) for a_ in prev for b_ in items)
-            prev = items
-        n_customers += 1
-        n_c[hh] += 1
-        item_c[hh].update(c_items)
-        pair_c[hh].update(c_pairs)
-    det.update(
-        {
-            "customers_analyzed": n_customers,
-            "baskets_analyzed": n_baskets,
-            "pair_operations": ops,
-            "candidate_items": len(names),
-            "sampling": "customers ordered by hash; all baskets of a customer kept together",
-        }
-    )
-    if n_baskets == 0 or not pair_b:
-        det["reason"] = "no co-purchase pairs within the budget"
-        return pd.DataFrame(), pd.DataFrame(), det
-    N = n_c[0] + n_c[1]
-    rows = []
-    for (i, j), cnt in pair_b.items():
-        if cnt / n_baskets < args.min_support:
-            continue
-        ab, a_, b_ = (
-            [cc[0].get(k, 0), cc[1].get(k, 0)]
-            for cc, k in ((pair_c, (i, j)), (item_c, i), (item_c, j))
-        )
-        rows.append((i, j, cnt, sum(ab), sum(a_), sum(b_), ab, a_, b_))
-    if not rows:
-        det["reason"] = "no pair reached --min-support"
-        return pd.DataFrame(), pd.DataFrame(), det
-    arr = lambda k: np.array([r_[k] for r_ in rows], float)  # noqa: E731
-    n_ab, n_a, n_bb = arr(3), arr(4), arr(5)
-    st = _pair_stats(n_ab, n_a, n_bb, N)
-    q = benjamini_hochberg(st["p_value"])
-    half_lift = np.array(
-        [
-            [
-                (r_[6][hh] * n_c[hh] / (r_[7][hh] * r_[8][hh]))
-                if min(r_[6][hh], r_[7][hh], r_[8][hh]) > 0
-                else np.nan
-                for hh in (0, 1)
-            ]
-            for r_ in rows
-        ]
-    )
-    out = []
-    for idx, (i, j, cnt, *_rest) in enumerate(rows):
-        for ante, cons in ((i, j), (j, i)):
-            conf = cnt / item_b[ante]
-            out.append(
-                {
-                    "basket_level": args.basket_level,
-                    "antecedent": names[ante],
-                    "consequent": names[cons],
-                    "pair_baskets": int(cnt),
-                    "basket_support": cnt / n_baskets,
-                    "confidence": conf,
-                    "basket_lift": conf / (item_b[cons] / n_baskets),
-                    "customers_with_pair": int(n_ab[idx]),
-                    "customer_lift": float(st["lift"][idx]),
-                    "customer_odds_ratio": float(st["odds_ratio"][idx]),
-                    "customer_odds_ratio_ci95_lower": float(st["or_ci95_lower"][idx]),
-                    "p_value": float(st["p_value"][idx]),
-                    "q_value_bh": float(q[idx]),
-                    "lift_half_a": float(half_lift[idx, 0]),
-                    "lift_half_b": float(half_lift[idx, 1]),
-                    "persistent_both_halves": bool(np.all(half_lift[idx] > 1.0)),
-                }
-            )
-    aff = pd.DataFrame(out)
-    det["pairs_tested"] = len(rows)
-    aff["passes_all_filters"] = (
-        (aff["confidence"] >= args.min_confidence)
-        & (aff["basket_lift"] >= args.min_lift)
-        & (aff["q_value_bh"] <= args.fdr_alpha)
-        & (aff["customer_odds_ratio_ci95_lower"] > 1.0)
-        & aff["persistent_both_halves"]
-    )
-    aff = aff.sort_values(
-        ["passes_all_filters", "customer_lift"], ascending=[False, False]
-    ).reset_index(drop=True)
-    tr = pd.DataFrame()
-    if n_trans >= 30:
-        trows = [
-            (a_, b_, c_) for (a_, b_), c_ in nxt_pair.items() if c_ / n_trans >= args.min_support
-        ]
-        if trows:
-            n_ab_t = np.array([t_[2] for t_ in trows], float)
-            n_a_t = np.array([nxt_from[t_[0]] for t_ in trows], float)
-            n_b_t = np.array([nxt_to[t_[1]] for t_ in trows], float)
-            st_t = _pair_stats(n_ab_t, n_a_t, n_b_t, n_trans)
-            tr = pd.DataFrame(
-                {
-                    "basket_level": args.basket_level,
-                    "from_item": [names[t_[0]] for t_ in trows],
-                    "next_trip_item": [names[t_[1]] for t_ in trows],
-                    "transitions": n_ab_t.astype(int),
-                    "p_next_given_from": n_ab_t / n_a_t,
-                    "p_next_overall": n_b_t / n_trans,
-                    "next_trip_lift": st_t["lift"],
-                    "odds_ratio_ci95_lower": st_t["or_ci95_lower"],
-                    "p_value": st_t["p_value"],
-                    "q_value_bh": benjamini_hochberg(st_t["p_value"]),
-                }
-            )
-            tr = tr[
-                (tr["q_value_bh"] <= args.fdr_alpha) & (tr["odds_ratio_ci95_lower"] > 1.0)
-            ].sort_values("next_trip_lift", ascending=False)
-            det["transitions_tested"] = len(trows)
-    det["status"] = "completed"
+
+    result = analyze_affinity(lines, as_of, config)
+
+    # Convert to legacy format expected by existing code
+    # The shared engine uses 'antecedent'/'consequent' but legacy code expects same
+    aff = result.associations
+    tr = result.transitions
+    det = result.diagnostics
+
+    # Ensure diagnostics has all expected fields
+    if "basket_level" not in det:
+        det["basket_level"] = args.basket_level
+    if "basket_grain" not in det:
+        det["basket_grain"] = args.frequency_grain
+
     return aff, tr, det
 
 

@@ -75,6 +75,7 @@ from retail_customer_analytics.ingestion import (
 from retail_customer_analytics.ingestion import (
     prepare_transaction_frame as canonical_prepare_transaction_frame,
 )
+from retail_customer_analytics.affinity import analyze_affinity_from_app
 
 # ruff: noqa: E402
 from retail_customer_analytics.metrics import (
@@ -1589,160 +1590,51 @@ def build_basket_associations(
     min_pair_count: int = 5,
 ) -> dict:
     """
-    Build product pair associations for a period.
+    Build product pair associations for a period using the shared affinity engine.
 
     Args:
         transactions: Normalized transaction DataFrame.
         context: Period context from get_period_context().
         min_support: Minimum support threshold (fraction of orders).
-        min_pair_count: Minimum co-occurrence count.
+        min_pair_count: Minimum co-occurrence count (used for compatibility).
 
     Returns:
         Dict with:
         - "product_metrics": Single product metrics (support, orders, revenue)
         - "pairs": Pair associations (support, confidence, lift, joint_revenue)
         - "parameters": Parameters used for reproducibility
+        - "diagnostics": Run diagnostics from shared engine
     """
-    df = get_period_transactions(transactions, context, "current")
-
-    if not ensure_not_empty(df, "basket associations"):
-        return {"product_metrics": pd.DataFrame(), "pairs": pd.DataFrame(), "parameters": {}}
-
-    total_orders = df["transaction_id"].nunique()
-
-    # Get product list per order
-    order_products = df.groupby("transaction_id")["product_id"].apply(list).reset_index()
-    order_products.columns = ["transaction_id", "products"]
-
-    # Single product metrics
-    prod_metrics = (
-        df.groupby("product_id")
-        .agg(
-            orders=("transaction_id", "nunique"),
-            revenue=("revenue", "sum"),
-            units=("quantity", "sum"),
-        )
-        .reset_index()
-    )
-    prod_metrics["support"] = prod_metrics["orders"] / total_orders
-
-    # Filter products by min support
-    freq_products = prod_metrics[prod_metrics["support"] >= min_support]["product_id"].tolist()
-
-    if len(freq_products) < 2:
-        return {
-            "single": prod_metrics,
-            "pairs": pd.DataFrame(),
-            "parameters": {"min_support": min_support, "min_pair_count": min_pair_count},
-        }
-
-    # Generate pairs within each basket - deduplicate products per invoice
-    from itertools import combinations
-
-    pairs = []
-    for _, row in order_products.iterrows():
-        products = sorted({p for p in row["products"] if p in freq_products})
-        if len(products) >= 2:
-            for a, b in combinations(products, 2):
-                pairs.append((a, b))
-
-    if not pairs:
-        return {
-            "single": prod_metrics,
-            "pairs": pd.DataFrame(),
-            "parameters": {"min_support": min_support, "min_pair_count": min_pair_count},
-        }
-
-    pair_df = pd.DataFrame(pairs, columns=["product_a", "product_b"])
-    pair_counts = (
-        pair_df.groupby(["product_a", "product_b"]).size().reset_index(name="co_occurrence")
-    )
-    pair_counts["support"] = pair_counts["co_occurrence"] / total_orders
-
-    # Filter by min support and min pair count
-    pair_counts = pair_counts[
-        (pair_counts["support"] >= min_support) & (pair_counts["co_occurrence"] >= min_pair_count)
-    ].copy()
-
-    if pair_counts.empty:
-        return {
-            "single": prod_metrics,
-            "pairs": pd.DataFrame(),
-            "parameters": {"min_support": min_support, "min_pair_count": min_pair_count},
-        }
-
-    # Merge single product metrics for confidence/lift
-    pair_counts = pair_counts.merge(
-        prod_metrics[["product_id", "orders"]].rename(
-            columns={"product_id": "product_a", "orders": "orders_a"}
-        ),
-        on="product_a",
-        how="left",
-    )
-    pair_counts = pair_counts.merge(
-        prod_metrics[["product_id", "orders"]].rename(
-            columns={"product_id": "product_b", "orders": "orders_b"}
-        ),
-        on="product_b",
-        how="left",
+    # Use shared affinity engine
+    result = analyze_affinity_from_app(
+        raw_df=transactions,
+        period_params=context,
+        min_support=min_support,
+        basket_level="product",
+        basket_grain="trip",
+        max_candidates=100,
+        max_baskets=5000,
+        max_items_per_basket=30,
+        max_pair_operations=100_000,
     )
 
-    pair_counts["confidence_a_to_b"] = pair_counts["co_occurrence"] / pair_counts["orders_a"]
-    pair_counts["confidence_b_to_a"] = pair_counts["co_occurrence"] / pair_counts["orders_b"]
-
-    # Lift = confidence / expected probability
-    pair_counts["lift"] = pair_counts["confidence_a_to_b"] / (
-        pair_counts["orders_b"] / total_orders
-    )
-
-    # Add joint basket revenue
-    joint_revenue = (
-        df[df["product_id"].isin(freq_products)]
-        .groupby("transaction_id")
-        .apply(
-            lambda x: (
-                x["revenue"].sum() if len(set(x["product_id"]) & set(freq_products)) >= 2 else 0
-            )
-        )
-        .reset_index(name="joint_revenue")
-    )
-
-    pair_joint_rev = {}
-    for _, row in pair_counts.iterrows():
-        a, b = row["product_a"], row["product_b"]
-        invoices_with_both = set(df[df["product_id"] == a]["transaction_id"]) & set(
-            df[df["product_id"] == b]["transaction_id"]
-        )
-        joint_rev = joint_revenue[joint_revenue["transaction_id"].isin(invoices_with_both)][
-            "joint_revenue"
-        ].sum()
-        pair_joint_rev[(a, b)] = joint_rev
-
-    pair_counts["joint_revenue"] = pair_counts.apply(
-        lambda r: pair_joint_rev.get((r["product_a"], r["product_b"]), 0), axis=1
-    )
-
-    # Merge descriptions
-    if "product_description" in transactions.columns:
-        desc_map = transactions[["product_id", "product_description"]].drop_duplicates()
-        pair_counts = pair_counts.merge(
-            desc_map.rename(columns={"product_id": "product_a", "product_description": "desc_a"}),
-            on="product_a",
-            how="left",
-        )
-        pair_counts = pair_counts.merge(
-            desc_map.rename(columns={"product_id": "product_b", "product_description": "desc_b"}),
-            on="product_b",
-            how="left",
-        )
-
-    # Sort by lift
-    pair_counts = pair_counts.sort_values("lift", ascending=False)
+    # Rename columns to match expected format
+    pairs = result.get("pairs", pd.DataFrame())
+    if not pairs.empty:
+        pairs = pairs.rename(columns={
+            "antecedent": "product_a",
+            "consequent": "product_b",
+            "pair_baskets": "co_occurrence",
+            "basket_support": "support",
+            "confidence": "confidence_a_to_b",
+            "basket_lift": "lift",
+        })
 
     return {
-        "product_metrics": prod_metrics,
-        "pairs": pair_counts,
+        "product_metrics": result.get("single", pd.DataFrame()),
+        "pairs": pairs,
         "parameters": {"min_support": min_support, "min_pair_count": min_pair_count},
+        "diagnostics": result.get("diagnostics", {}),
     }
 
 
@@ -5330,125 +5222,37 @@ def _plot_category_contribution_from_features(cat_features: pd.DataFrame) -> tup
 def _compute_basket_analysis(
     raw_df: pd.DataFrame, period_params: dict, min_support: float = 0.01
 ) -> dict:
-    """Compute product pair associations: support, confidence, lift."""
-    try:
-        ctx = get_period_context(period_params)
+    """Compute product pair associations: support, confidence, lift.
 
-        curr_df = get_period_transactions(raw_df, ctx, "current")
+    Uses the shared affinity engine to avoid unbounded pair materialization.
+    """
+    result = analyze_affinity_from_app(
+        raw_df=raw_df,
+        period_params=period_params,
+        min_support=min_support,
+        basket_level="product",
+        basket_grain="trip",
+        max_candidates=100,
+        max_baskets=5000,
+        max_items_per_basket=30,
+        max_pair_operations=100_000,
+    )
 
-        if not ensure_not_empty(curr_df, "basket analysis current period"):
-            return {}
+    pairs = result.get("pairs", pd.DataFrame())
+    if not pairs.empty:
+        pairs = pairs.rename(columns={
+            "antecedent": "product_a",
+            "consequent": "product_b",
+            "pair_baskets": "co_occurrence",
+            "basket_support": "support",
+            "confidence": "confidence_a_to_b",
+            "basket_lift": "lift",
+        })
 
-        total_orders = curr_df["transaction_id"].nunique()
-
-        # Get product list per order
-        order_products = curr_df.groupby("transaction_id")["product_id"].apply(list).reset_index()
-        order_products.columns = ["transaction_id", "products"]
-
-        # Single product metrics (revenue already calculated)
-        prod_metrics = (
-            curr_df.groupby("product_id")
-            .agg(
-                orders=("transaction_id", "nunique"),
-                revenue=("revenue", "sum"),
-                units=("quantity", "sum"),
-            )
-            .reset_index()
-        )
-        prod_metrics["support"] = prod_metrics["orders"] / total_orders
-
-        # Filter products by min support
-        freq_products = prod_metrics[prod_metrics["support"] >= min_support]["product_id"].tolist()
-
-        if len(freq_products) < 2:
-            return {"single": prod_metrics, "pairs": pd.DataFrame()}
-
-        # Generate pairs within each basket - deduplicate products per invoice
-        from itertools import combinations
-
-        pairs = []
-        for _, row in order_products.iterrows():
-            # Deduplicate products within each invoice to avoid A-A pairs and double-counting
-            products = sorted({p for p in row["products"] if p in freq_products})
-            if len(products) >= 2:
-                for a, b in combinations(products, 2):
-                    pairs.append((a, b))
-
-        if not pairs:
-            return {"single": prod_metrics, "pairs": pd.DataFrame()}
-
-        pair_df = pd.DataFrame(pairs, columns=["product_a", "product_b"])
-        pair_counts = (
-            pair_df.groupby(["product_a", "product_b"]).size().reset_index(name="co_occurrence")
-        )
-        pair_counts["support"] = pair_counts["co_occurrence"] / total_orders
-
-        # Filter by min support
-        pair_counts = pair_counts[pair_counts["support"] >= min_support].copy()
-
-        if pair_counts.empty:
-            return {"single": prod_metrics, "pairs": pd.DataFrame()}
-
-        # Merge single product metrics for confidence/lift
-        pair_counts = pair_counts.merge(
-            prod_metrics[["product_id", "orders"]].rename(
-                columns={"product_id": "product_a", "orders": "orders_a"}
-            ),
-            on="product_a",
-            how="left",
-        )
-        pair_counts = pair_counts.merge(
-            prod_metrics[["product_id", "orders"]].rename(
-                columns={"product_id": "product_b", "orders": "orders_b"}
-            ),
-            on="product_b",
-            how="left",
-        )
-
-        pair_counts["confidence_a_to_b"] = pair_counts["co_occurrence"] / pair_counts["orders_a"]
-        pair_counts["confidence_b_to_a"] = pair_counts["co_occurrence"] / pair_counts["orders_b"]
-
-        # Lift = confidence / expected probability
-        pair_counts["lift"] = pair_counts["confidence_a_to_b"] / (
-            pair_counts["orders_b"] / total_orders
-        )
-
-        # Add joint basket revenue (revenue from invoices containing both products)
-        # Compute joint revenue by finding invoices with both products
-        joint_revenue = (
-            curr_df[curr_df["product_id"].isin(freq_products)]
-            .groupby("transaction_id")
-            .apply(
-                lambda x: (
-                    x["revenue"].sum() if len(set(x["product_id"]) & set(freq_products)) >= 2 else 0
-                )
-            )
-            .reset_index(name="joint_revenue")
-        )
-
-        # For each pair, sum joint revenue from invoices containing both
-        pair_joint_rev = {}
-        for _, row in pair_counts.iterrows():
-            a, b = row["product_a"], row["product_b"]
-            # Find invoices containing both a and b
-            invoices_with_both = set(curr_df[curr_df["product_id"] == a]["transaction_id"]) & set(
-                curr_df[curr_df["product_id"] == b]["transaction_id"]
-            )
-            joint_rev = joint_revenue[joint_revenue["transaction_id"].isin(invoices_with_both)][
-                "joint_revenue"
-            ].sum()
-            pair_joint_rev[(a, b)] = joint_rev
-
-        pair_counts["joint_revenue"] = pair_counts.apply(
-            lambda r: pair_joint_rev.get((r["product_a"], r["product_b"]), 0), axis=1
-        )
-
-        # Sort by lift
-        pair_counts = pair_counts.sort_values("lift", ascending=False)
-
-        return {"single": prod_metrics, "pairs": pair_counts}
-    except Exception:
-        return {}
+    return {
+        "single": result.get("single", pd.DataFrame()),
+        "pairs": pairs,
+    }
 
 
 def _plot_basket_network(pairs_df: pd.DataFrame, top_n: int = 30) -> tuple | None:

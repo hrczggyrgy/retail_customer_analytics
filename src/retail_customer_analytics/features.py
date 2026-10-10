@@ -15,6 +15,8 @@ from collections.abc import Sequence
 import numpy as np
 import pandas as pd
 
+from retail_customer_analytics.events import EventConfig, build_purchase_events, match_returns
+
 LOGGER = logging.getLogger("retail_analysis.features")
 
 
@@ -41,14 +43,18 @@ def build_customer_snapshot(
     Returns:
         DataFrame with one row per customer, indexed by customer_id
     """
-    # Build purchase events
-    trips = _build_trips_for_snapshot(transactions, as_of, event_grain)
+    # Build purchase events using canonical event construction
+    event_config = EventConfig(basket_grain=event_grain)
+    trips = build_purchase_events(transactions, as_of, event_config)
 
     if trips.empty:
         return pd.DataFrame()
 
     # Core RFM and cadence features
     cust = _core_customer_features(trips, as_of)
+
+    # Build return features using customer index from core features
+    returns_info = _return_features(transactions, cust.index, as_of)
 
     # Rolling window features
     win = _window_features(transactions, trips, cust.index, as_of, windows_days, recent_window_days)
@@ -58,11 +64,25 @@ def build_customer_snapshot(
     breadth = _breadth_features(transactions, cust.index, as_of)
     cust = cust.join(breadth)
 
-    # Net spend = gross (no returns)
+    # Return-aware financial features
+    # net_spend = gross_spend - return_value (semantic distinction maintained)
+    # return_value_ratio = return_value / gross_spend (0.0 when no returns)
     if "gross_spend" in cust.columns:
-        cust["net_spend"] = cust["gross_spend"]
+        return_value = returns_info.get("return_value", pd.Series(0.0, index=cust.index))
+        cust["return_value"] = return_value
+        cust["net_spend"] = (cust["gross_spend"] - cust["return_value"]).clip(lower=0)
+        cust["return_value_ratio"] = (
+            cust["return_value"] / cust["gross_spend"]
+        ).clip(0, 1).fillna(0.0)
     else:
+        cust["return_value"] = 0.0
         cust["net_spend"] = 0.0
+        cust["return_value_ratio"] = 0.0
+
+    # Unmatched return value (for diagnostic purposes)
+    cust["unmatched_return_value"] = returns_info.get(
+        "unmatched_return_value", pd.Series(0.0, index=cust.index)
+    )
 
     # Price/promo proxy features
     promo = _promo_features(transactions, cust.index, as_of)
@@ -83,59 +103,56 @@ def build_customer_snapshot(
     return cust
 
 
+def _return_features(
+    transactions: pd.DataFrame,
+    customer_index: pd.Index,
+    as_of: pd.Timestamp,
+) -> dict[str, pd.Series]:
+    """Compute return-related features for customers.
+
+    Returns dict with:
+    - return_value: total matched return value per customer
+    - unmatched_return_value: total unmatched return value per customer
+    """
+    # Use shared return matching logic
+    matched_returns, _ = match_returns(transactions, as_of)
+
+    if matched_returns.empty:
+        return {
+            "return_value": pd.Series(0.0, index=customer_index),
+            "unmatched_return_value": pd.Series(0.0, index=customer_index),
+        }
+
+    # Filter to cutoff
+    ret = matched_returns[matched_returns["transaction_day"] <= as_of]
+
+    # Matched return value per customer
+    rv = (-ret["line_revenue"]).clip(lower=0).fillna(0.0)
+    return_value = rv.groupby(ret["customer_id"]).sum().reindex(customer_index).fillna(0.0)
+
+    # Unmatched return value
+    um = ~ret["matched"]
+    unmatched_return_value = (
+        rv[um].groupby(ret.loc[um, "customer_id"]).sum().reindex(customer_index).fillna(0.0)
+    )
+
+    return {
+        "return_value": return_value,
+        "unmatched_return_value": unmatched_return_value,
+    }
+
+
 def _build_trips_for_snapshot(
     transactions: pd.DataFrame,
     as_of: pd.Timestamp,
     grain: str = "trip",
 ) -> pd.DataFrame:
-    """Build purchase events (trips) up to snapshot date."""
-    # Only positive purchases before cutoff
-    buys = transactions[
-        (transactions["quantity"] > 0)
-        & transactions["customer_id"].notna()
-        & transactions["transaction_day"].notna()
-        & (transactions["transaction_day"] <= as_of)
-    ].copy()
+    """Build purchase events (trips) up to snapshot date.
 
-    if grain == "transaction":
-        buys = buys[buys["transaction_id"].notna()]
-
-    if buys.empty:
-        return pd.DataFrame(
-            columns=[
-                "customer_id",
-                "transaction_day",
-                "trip_value",
-                "n_lines",
-                "n_products",
-                "n_units",
-            ]
-        )
-
-    buys["rev_pos"] = buys["line_revenue"].clip(lower=0).fillna(0.0)
-
-    if grain == "trip":
-        keys = ["customer_id", "transaction_day"]
-        spec = {
-            "trip_value": ("rev_pos", "sum"),
-            "n_lines": ("quantity", "size"),
-            "n_products": ("product_id", "nunique"),
-            "n_units": ("quantity", "sum"),
-        }
-    else:
-        keys = ["customer_id", "transaction_id"]
-        spec = {
-            "trip_value": ("rev_pos", "sum"),
-            "n_lines": ("quantity", "size"),
-            "n_products": ("product_id", "nunique"),
-            "n_units": ("quantity", "sum"),
-            "transaction_day": ("transaction_day", "min"),
-        }
-
-    trips = buys.groupby(keys, sort=False).agg(**spec).reset_index()
-    trips = trips[trips["trip_value"] > 0].reset_index(drop=True)
-
-    return trips
+    Kept for backward compatibility; new code should use events.build_purchase_events.
+    """
+    event_config = EventConfig(basket_grain=grain)
+    return build_purchase_events(transactions, as_of, event_config)
 
 
 def _core_customer_features(
@@ -339,7 +356,10 @@ def _category_affinity_features(
     as_of: pd.Timestamp,
     max_categories: int = 30,
 ) -> pd.DataFrame:
-    """Per-customer category spend share and recency."""
+    """Per-customer category spend share and recency.
+
+    Uses long-form aggregation to avoid dense customer-by-category matrices.
+    """
     f = pd.DataFrame(index=index)
 
     pos = transactions[
@@ -359,8 +379,10 @@ def _category_affinity_features(
     )
     pos["category_grouped"] = pos["category"].where(pos["category"].isin(top_cats), "__other__")
 
-    # Category spend shares
+    # Category spend shares - compute in long form first
     cat_spend = pos.groupby(["customer_id", "category_grouped"])["rev"].sum().reset_index()
+
+    # Pivot only for share computation (bounded by max_categories)
     cat_pivot = cat_spend.pivot(
         index="customer_id", columns="category_grouped", values="rev"
     ).fillna(0)
@@ -390,7 +412,11 @@ def _trend_features(
     index: pd.Index,
     as_of: pd.Timestamp,
 ) -> pd.DataFrame:
-    """Behavioral trend features: monthly revenue slope, volatility, active months fraction."""
+    """Behavioral trend features: monthly revenue slope, volatility, active months fraction.
+
+    Fixes: Includes zero-activity months in the trend calculation by constructing
+    a complete calendar-month series for each customer.
+    """
     f = pd.DataFrame(index=index)
 
     pos = transactions[
@@ -407,44 +433,56 @@ def _trend_features(
         f["active_months_fraction"] = 0.0
         return f
 
+    # Monthly aggregation
     monthly = pos.groupby(["customer_id", "month"])["rev"].sum().reset_index()
 
-    # Need at least 3 months for trend
-    month_counts = monthly.groupby("customer_id")["month"].nunique()
-    valid_customers = month_counts[month_counts >= 3].index
+    # Build complete monthly grid for each customer (fixes zero-activity month omission)
+    # Window: last 12 months or available history
+    window_start = as_of - pd.DateOffset(months=12)
+    all_months = pd.period_range(
+        start=window_start.to_period("M"),
+        end=as_of.to_period("M"),
+        freq="M",
+    )
 
-    if len(valid_customers) == 0:
-        f["monthly_revenue_slope"] = np.nan
-        f["monthly_revenue_cv"] = np.nan
-        f["active_months_fraction"] = (month_counts > 0).reindex(index).astype(int)
-        return f
-
-    # Compute slope on log(1+rev) for each customer
+    # For each customer, create complete monthly series with zeros for inactive months
+    # This is more memory-efficient than pivoting all customers at once
     slopes = {}
     cvs = {}
-    for cust_id in valid_customers:
-        cust_months = monthly[monthly["customer_id"] == cust_id].sort_values("month")
-        if len(cust_months) >= 3:
-            # Convert period to numeric (months since first)
+    active_month_counts = {}
+
+    for cust_id in monthly["customer_id"].unique():
+        cust_months = monthly[monthly["customer_id"] == cust_id].set_index("month")["rev"]
+        # Reindex to full month range, filling with 0
+        cust_months = cust_months.reindex(all_months, fill_value=0.0)
+
+        active_months = int((cust_months > 0).sum())
+        active_month_counts[cust_id] = active_months
+
+        if active_months >= 3:
+            # Convert period to numeric (months since first in window)
             x = np.arange(len(cust_months), dtype=float)
-            y = np.log1p(cust_months["rev"].values)
+            y = np.log1p(cust_months.values)
             if np.ptp(x) > 0 and np.ptp(y) > 0:
                 slope = np.polyfit(x, y, 1)[0]
                 slopes[cust_id] = slope
             cvs[cust_id] = (
-                np.std(cust_months["rev"]) / np.mean(cust_months["rev"])
-                if np.mean(cust_months["rev"]) > 0
+                np.std(cust_months) / np.mean(cust_months)
+                if np.mean(cust_months) > 0
                 else np.nan
             )
+        else:
+            slopes[cust_id] = np.nan
+            cvs[cust_id] = np.nan
 
     f["monthly_revenue_slope"] = pd.Series(slopes).reindex(index)
     f["monthly_revenue_cv"] = pd.Series(cvs).reindex(index)
 
     # Active months fraction (observed months / total possible months in window)
-    # Window: last 12 months or available history
-    window_start = as_of - pd.DateOffset(months=12)
-    total_months = (as_of.to_period("M") - window_start.to_period("M")).n
-    f["active_months_fraction"] = (month_counts / total_months).reindex(index).fillna(0).clip(0, 1)
+    total_months = len(all_months)
+    f["active_months_fraction"] = (
+        pd.Series(active_month_counts).reindex(index).fillna(0) / total_months
+    ).clip(0, 1)
 
     return f
 
@@ -472,8 +510,8 @@ def _basket_composition_features(
         f["trip_revenue_cv"] = np.nan
         return f
 
-    # Per-trip metrics
-    event_col = "transaction_day"  # Default to trip grain
+    # Per-trip metrics (using trip grain by default)
+    event_col = "transaction_day"
     trip_products = pos.groupby([pos["customer_id"], pos[event_col]])["product_id"].nunique()
     trip_categories = (
         pos[pos["category"].notna()]
@@ -515,3 +553,106 @@ def build_customer_features(
         windows_days=windows_days,
         recent_window_days=recent_window_days,
     )
+
+
+# Feature contract validation
+REQUIRED_FEATURES = [
+    "n_trips",
+    "recency_days",
+    "gross_spend",
+    "net_spend",
+    "return_value",
+    "return_value_ratio",
+    "x",
+    "T",
+    "t_x",
+    "mean_trip_value",
+    "mean_basket_products",
+    "median_basket_products",
+    "median_gap_days",
+    "mean_gap_days",
+    "std_gap_days",
+    "n_gaps",
+    "interpurchase_cv",
+    "regularity_shape_raw",
+    "regularity_shape_shrunk",
+    "heuristic_threshold_days",
+    "heuristic_inactive_flag",
+]
+
+
+OPTIONAL_FEATURES = [
+    "gross_purchase_revenue_30d",
+    "gross_purchase_revenue_90d",
+    "gross_purchase_revenue_365d",
+    "trips_30d",
+    "trips_90d",
+    "trips_365d",
+    "recent_gross_purchase_revenue",
+    "prior_gross_purchase_revenue",
+    "recent_trips",
+    "prior_trips",
+    "recent_revenue_change_pct_if_prior_positive",
+    "recent_trip_change_pct_if_prior_positive",
+    "unique_products_purchased",
+    "unique_categories_purchased",
+    "unique_departments_purchased",
+    "top_category_by_spend",
+    "top_department_by_spend",
+    "category_spend_hhi",
+    "department_spend_hhi",
+    "promo_spend_share",
+    "mean_price_index",
+    "price_index_median",
+    "category_entropy",
+    "top_category_by_spend_affinity",
+    "monthly_revenue_slope",
+    "monthly_revenue_cv",
+    "active_months_fraction",
+    "mean_distinct_products_per_trip",
+    "mean_distinct_categories_per_trip",
+    "mean_units_per_trip",
+    "trip_revenue_cv",
+    "unmatched_return_value",
+]
+
+
+def validate_feature_contract(
+    features: pd.DataFrame,
+    strict: bool = False,
+) -> dict[str, Any]:
+    """Validate that feature DataFrame contains all required features.
+
+    Args:
+        features: DataFrame from build_customer_snapshot
+        strict: If True, raise on missing required features
+
+    Returns:
+        Dict with validation results
+    """
+    result = {
+        "valid": True,
+        "missing_required": [],
+        "missing_optional": [],
+        "extra_columns": [],
+        "n_customers": len(features),
+        "n_features": len(features.columns),
+    }
+
+    missing_req = [f for f in REQUIRED_FEATURES if f not in features.columns]
+    missing_opt = [f for f in OPTIONAL_FEATURES if f not in features.columns]
+
+    result["missing_required"] = missing_req
+    result["missing_optional"] = missing_opt
+
+    if missing_req:
+        result["valid"] = False
+        msg = f"Missing required features: {missing_req}"
+        if strict:
+            raise ValueError(msg)
+        LOGGER.warning(msg)
+
+    if missing_opt:
+        LOGGER.info("Missing optional features: %s", missing_opt)
+
+    return result

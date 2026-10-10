@@ -11,6 +11,9 @@ from .features import (
     _window_features,
     build_customer_features,
     build_customer_snapshot,
+    validate_feature_contract,
+    REQUIRED_FEATURES,
+    OPTIONAL_FEATURES,
 )
 from .ingestion import (
     CURRENCY_SYMBOLS,
@@ -28,6 +31,20 @@ from .ingestion import (
     parse_dates,
     prepare_transaction_frame,
     structural_checks,
+)
+from .events import (
+    EventConfig,
+    build_purchase_events,
+    build_baskets,
+    match_returns,
+    add_price_index,
+    validate_event_grain,
+)
+from .affinity import (
+    AffinityConfig,
+    AffinityResult,
+    analyze_affinity,
+    analyze_affinity_from_app,
 )
 
 __all__ = [
@@ -48,6 +65,9 @@ __all__ = [
     "fmt_pct",
     "build_customer_snapshot",
     "build_customer_features",
+    "validate_feature_contract",
+    "REQUIRED_FEATURES",
+    "OPTIONAL_FEATURES",
     "_build_trips_for_snapshot",
     "_core_customer_features",
     "_window_features",
@@ -56,6 +76,16 @@ __all__ = [
     "_category_affinity_features",
     "_trend_features",
     "_basket_composition_features",
+    "EventConfig",
+    "build_purchase_events",
+    "build_baskets",
+    "match_returns",
+    "add_price_index",
+    "validate_event_grain",
+    "AffinityConfig",
+    "AffinityResult",
+    "analyze_affinity",
+    "analyze_affinity_from_app",
 ]
 
 __version__ = "0.1.0"
