@@ -21,13 +21,13 @@ classifiers = [
 ]
 requires-python = ">=3.10"
 dependencies = [
-    "numpy>=1.24.0",
-    "pandas>=2.0.0",
-    "scipy>=1.10.0",
-    "matplotlib>=3.7.0",
-    "networkx>=3.0",
-    "pyarrow>=12.0.0",
-    "streamlit>=1.25.0",
+    "numpy>=1.26.0",
+    "pandas>=2.1.0",
+    "scipy>=1.11.0",
+    "matplotlib>=3.8.0",
+    "networkx>=3.2.0",
+    "pyarrow>=14.0.0",
+    "streamlit>=1.28.0",
 ]
 
 [project.optional-dependencies]

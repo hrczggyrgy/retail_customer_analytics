@@ -47,13 +47,22 @@ jobs:
         run: |
           python data_generator.py --customers 100 --start 2025-01-01 --seed 42 --output /tmp/test_output
 
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install linting dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install ruff
       - name: Check code style (ruff)
-        if: always()
         run: |
           ruff check . --output-format=github
-
       - name: Check formatting (ruff format)
-        if: always()
         run: |
           ruff format . --check
 
