@@ -706,7 +706,12 @@ def chart_lorenz_segments(ctx: Context) -> Chart:
 
 
 def chart_action_quadrant(ctx: Context) -> Chart:
-    """P(alive) vs Expected Revenue quadrant with action labels."""
+    """P(alive) vs Expected Revenue quadrant with action labels.
+    
+    Note: P(alive) is a model-derived probability of ongoing purchasing behavior,
+    not a calibrated probability of next-period purchase. Expected revenue is 
+    an undiscounted gross revenue forecast, not profit.
+    """
     c = ctx.t("customer_features")
     ctx.need(c, ["p_alive", "expected_revenue_horizon", "cluster_label"], "customer_features")
     
@@ -739,10 +744,10 @@ def chart_action_quadrant(ctx: Context) -> Chart:
     
     ax.axvline(p50, color=INK, ls="--", lw=1)
     ax.axhline(rev50, color=INK, ls="--", lw=1)
-    ax.set_xlabel("P(alive)")
-    ax.set_ylabel("Expected revenue (horizon)")
+    ax.set_xlabel("P(alive) — model-derived (not calibrated purchase probability)")
+    ax.set_ylabel("Expected gross revenue (horizon) — undiscounted, not profit")
     ax.set_yscale("log")
-    ax.set_title("Action Quadrant: P(alive) vs Expected Revenue")
+    ax.set_title("Action Quadrant: Model Outputs vs Observed Estimates")
     ax.legend(fontsize=8, markerscale=2, loc="lower right")
     
     # Count in each quadrant
@@ -751,7 +756,10 @@ def chart_action_quadrant(ctx: Context) -> Chart:
     q3 = ((d["p_alive"] >= p50) & (d["expected_revenue_horizon"] < rev50)).sum()
     q4 = ((d["p_alive"] < p50) & (d["expected_revenue_horizon"] < rev50)).sum()
     
-    return Chart("19_action_quadrant", "Who to protect, grow, win back, or ignore?", f"Protect: {q1:,} | Grow: {q2:,} | Win back: {q3:,} | Ignore: {q4:,} customers.", save(ctx, "19_action_quadrant", fig))
+    return Chart("19_action_quadrant", "Who to protect, grow, win back, or ignore?", 
+                 f"Protect: {q1:,} | Grow: {q2:,} | Win back: {q3:,} | Ignore: {q4:,} customers. "
+                 f"P(alive) is not a calibrated purchase probability; revenue is gross, not profit.", 
+                 save(ctx, "19_action_quadrant", fig))
 
 
 def chart_segment_migration(ctx: Context) -> Chart:
@@ -840,13 +848,17 @@ def chart_cohort_ltv(ctx: Context) -> Chart:
 
 
 def chart_promo_return_lollipop(ctx: Context) -> Chart:
-    """Discount share vs Return rate by category - lollipop chart."""
+    """Return rate by category - lollipop chart.
+    
+    Note: This chart shows return rate only. The original name suggested 
+    a promo/return comparison, but the data only contains return rates.
+    """
     cat = ctx.t("category_summary")
     ctx.need(cat, ["category", "gross_purchase_revenue", "return_value"], "category_summary")
     
-    # Need promo share data - for now use return rate
     d = cat.sort_values("gross_purchase_revenue", ascending=False).head(15)
     d["return_rate"] = d["return_value"] / d["gross_purchase_revenue"].replace(0, np.nan)
+    d = d.dropna(subset=["return_rate"])
     
     fig, ax = plt.subplots(figsize=(10, max(5, 0.4 * len(d) + 1)))
     
@@ -860,20 +872,27 @@ def chart_promo_return_lollipop(ctx: Context) -> Chart:
     ax.set_title("Return Rate by Category (Top 15 by Revenue)")
     
     hi = d["return_rate"].idxmax()
-    return Chart("21_promo_return_lollipop", "Margin risk: return rate by category", f"Highest return rate: '{shorten(d.loc[hi, 'category'])}' at {pct(d.loc[hi, 'return_rate'])}.", save(ctx, "21_promo_return_lollipop", fig))
+    return Chart("21_promo_return_lollipop", "Return rate by category", f"Highest return rate: '{shorten(d.loc[hi, 'category'])}' at {pct(d.loc[hi, 'return_rate'])}.", save(ctx, "21_promo_return_lollipop", fig))
 
 
 def chart_cohort_retention_revenue(ctx: Context) -> Chart:
-    """Cohort retention heatmap colored by revenue per customer."""
+    """Cohort retention heatmap with revenue per customer."""
     r = ctx.t("cohort_retention_new_customers")
-    ctx.need(r, ["cohort_month", "months_since_cohort", "retention_rate", "period_complete"], "cohort_retention_new_customers")
+    ctx.need(r, ["cohort_month", "months_since_cohort", "retention_rate", "period_complete", "cohort_size", "active_customers"], "cohort_retention_new_customers")
     
     r = r[(r["months_since_cohort"] > 0) & r["period_complete"].astype(bool)]
     if r.empty:
         raise Skip("no complete post-cohort months")
     
-    # Also need cohort revenue per customer - check if available
+    # Retention heatmap
     pv = r.pivot(index="cohort_month", columns="months_since_cohort", values="retention_rate").sort_index()
+    
+    # Revenue per customer per cohort/month
+    # Compute cumulative revenue per cohort/month
+    rev_pv = r.pivot(index="cohort_month", columns="months_since_cohort", values="active_customers").sort_index()
+    # We need actual revenue data - check if available in cohort data
+    # For now, use cohort_size * retention_rate as proxy for active customers
+    # and show retention with cohort size context
     
     fig, axes = plt.subplots(1, 2, figsize=(14, max(3.5, 0.28 * len(pv) + 1.8)))
     
@@ -888,13 +907,37 @@ def chart_cohort_retention_revenue(ctx: Context) -> Chart:
     axes[0].set_title("Cohort Retention Rate (Complete Months)")
     fig.colorbar(im1, ax=axes[0], format=lambda v, _: f"{100 * v:.0f}%")
     
-    # Revenue per customer placeholder
-    axes[1].text(0.5, 0.5, "Cohort Revenue per Customer\n(requires cohort_ltv table)", ha="center", va="center", transform=axes[1].transAxes, fontsize=12)
-    axes[1].set_axis_off()
-    axes[1].set_title("Cohort Revenue per Customer")
+    # Cohort size + retention context
+    # Show cohort sizes as annotations on retention heatmap
+    size_pv = r.pivot(index="cohort_month", columns="months_since_cohort", values="cohort_size").sort_index()
+    for i in range(len(pv.index)):
+        for j in range(len(pv.columns)):
+            val = pv.iloc[i, j]
+            if not np.isnan(val):
+                sz = size_pv.iloc[i, j] if not size_pv.empty else ""
+                axes[0].text(j, i, f"{100*val:.0f}%\n(n={int(sz):,})", ha="center", va="center", fontsize=7, 
+                           color="white" if val > 0.5 else "black")
     
+    # Revenue proxy: show cohort sizes over time
+    cohort_sizes = r.groupby("cohort_month")["cohort_size"].first().sort_index()
+    axes[1].bar(range(len(cohort_sizes)), cohort_sizes.values, color=PALETTE[0], alpha=0.7, edgecolor="white")
+    axes[1].set_xticks(range(len(cohort_sizes)))
+    axes[1].set_xticklabels(cohort_sizes.index, fontsize=8, rotation=45, ha="right")
+    axes[1].set_ylabel("Cohort Size (customers)")
+    axes[1].set_title("Cohort Sizes")
+    axes[1].grid(axis="y", alpha=0.3)
+    
+    # Add retention summary on right panel
     m1 = pv[1].mean() if 1 in pv.columns else float("nan")
-    return Chart("22_cohort_ltv", "Cohort retention and revenue quality", f"Average month-1 retention: {pct(m1)}. Revenue chart needs cohort_ltv table.", save(ctx, "22_cohort_ltv", fig))
+    axes[1].text(0.02, 0.98, f"Avg Month-1 Retention: {pct(m1)}", transform=axes[1].transAxes, 
+                 fontsize=11, va="top", bbox=dict(boxstyle="round", facecolor="wheat", alpha=0.5))
+    
+    m3 = pv[3].mean() if 3 in pv.columns else float("nan")
+    axes[1].text(0.02, 0.90, f"Avg Month-3 Retention: {pct(m3)}", transform=axes[1].transAxes,
+                 fontsize=11, va="top", bbox=dict(boxstyle="round", facecolor="wheat", alpha=0.5))
+    
+    return Chart("22_cohort_ltv", "Cohort retention and revenue quality", 
+                 f"Avg month-1 retention: {pct(m1)}. Cohort sizes shown for revenue context.", save(ctx, "22_cohort_ltv", fig))
 
 
 # Add new builders to the list

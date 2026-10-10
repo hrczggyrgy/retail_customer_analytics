@@ -228,14 +228,18 @@ def softmax(x):
 def generate(
     customers=5000,
     start="2025-01-01",
-    end="2026-12-31",
+    end=None,
     seed=42,
     output="retail_output",
     annual_inflation=0.025,
     enable_returns=True,
 ):
     start = pd.Timestamp(start).normalize()
-    end = pd.Timestamp(end).normalize()
+    # Default end to today's date (normalized) to avoid future-dated demo data
+    if end is None:
+        end = pd.Timestamp.now().normalize()
+    else:
+        end = pd.Timestamp(end).normalize()
 
     if customers < 1 or end < start or annual_inflation <= -1:
         raise ValueError(
@@ -1145,7 +1149,7 @@ def main():
         "--start", default="2025-01-01"
     )
     parser.add_argument(
-        "--end", default="2026-12-31"
+        "--end", default=None, help="End date (default: today)"
     )
     parser.add_argument(
         "--seed", type=int, default=42

@@ -65,6 +65,16 @@ APP_DIR = Path(__file__).resolve().parent
 if str(APP_DIR) not in sys.path:
     sys.path.insert(0, str(APP_DIR))
 
+# Import shared ingestion module
+sys.path.insert(0, str(APP_DIR / "src"))
+from retail_customer_analytics.ingestion import (
+    REQUIRED_COLUMNS as APP_REQUIRED_COLUMNS,
+    prepare_transaction_frame as canonical_prepare_transaction_frame,
+    fmt_currency,
+    fmt_number,
+    fmt_pct,
+)
+
 # ============================================================
 # 01. Constants and configuration
 # ============================================================
@@ -969,43 +979,25 @@ def prepare_transaction_frame(df: pd.DataFrame) -> pd.DataFrame:
     """
     Normalize transaction DataFrame once per analysis run.
     
-    Validates required columns, converts types, creates transaction_day,
-    calculates revenue = quantity * price, applies purchase policy (positive qty only).
+    Uses the canonical ingestion module for consistent preprocessing.
     
     Returns DataFrame with explicit columns and dtypes.
     """
-    REQUIRED_COLS = ["customer_id", "transaction_date", "transaction_id", 
-                     "product_id", "quantity", "price"]
-    missing = [c for c in REQUIRED_COLS if c not in df.columns]
-    if missing:
-        raise ValueError(f"Missing required columns: {missing}")
+    # Map app column names to canonical names
+    col_map = {
+        "invoice_id": "transaction_id",
+        "description": "product_description",
+        "unit_price": "price",
+        "transaction_datetime": "transaction_date",
+    }
+    df = df.rename(columns={k: v for k, v in col_map.items() if k in df.columns})
     
-    df = df.copy()
+    # Use canonical preparation
+    df = canonical_prepare_transaction_frame(df)
     
-    # Convert identifiers to stable strings
-    df["customer_id"] = df["customer_id"].astype("string")
-    df["transaction_id"] = df["transaction_id"].astype("string")
-    df["product_id"] = df["product_id"].astype("string")
-    if "product_description" in df.columns:
-        df["product_description"] = df["product_description"].astype("string")
-    if "department" in df.columns:
-        df["department"] = df["department"].astype("string")
-    if "category" in df.columns:
-        df["category"] = df["category"].astype("string")
-    
-    # Convert dates
-    df["transaction_date"] = pd.to_datetime(df["transaction_date"], errors="coerce")
-    df["transaction_day"] = df["transaction_date"].dt.normalize()
-    
-    # Convert numerics
-    df["quantity"] = pd.to_numeric(df["quantity"], errors="coerce")
-    df["price"] = pd.to_numeric(df["price"], errors="coerce")
-    
-    # Drop rows with invalid core data
-    df = df.dropna(subset=["transaction_day", "quantity", "price"])
-    
-    # Calculate revenue once (positive purchases only for core metrics)
-    df["revenue"] = df["quantity"] * df["price"]
+    # Ensure revenue column exists (alias for line_revenue)
+    if "line_revenue" in df.columns:
+        df["revenue"] = df["line_revenue"]
     
     return df
 
@@ -1572,27 +1564,9 @@ def build_basket_associations(
     }
 
 
-def fmt_currency(v: float) -> str:
-    if v >= 1e9:
-        return f"${v/1e9:.1f}B"
-    elif v >= 1e6:
-        return f"${v/1e6:.1f}M"
-    elif v >= 1e3:
-        return f"${v/1e3:.1f}K"
-    else:
-        return f"${v:,.0f}"
-
-def fmt_number(v: float) -> str:
-    if v >= 1e6:
-        return f"{v/1e6:.1f}M"
-    elif v >= 1e3:
-        return f"{v/1e3:.1f}K"
-    else:
-        return f"{v:,.0f}"
-
-def fmt_pct(v: float) -> str:
-    sign = "+" if v >= 0 else ""
-    return f"{sign}{v:.1f}%"
+# Currency configuration - can be overridden via config or environment
+DEFAULT_CURRENCY = "EUR"
+CURRENCY_SYMBOLS = {"EUR": "€", "USD": "$", "GBP": "£", "JPY": "¥"}
 
 def revenue_waterfall_data(current: dict, prior: dict) -> list[dict]:
     """Compute revenue waterfall decomposition.
@@ -2036,7 +2010,7 @@ import numpy as np
 # --------------------------------------------------------------------------- #
 def make_synthetic(n_customers: int = 3000, days: int = 730, seed: int = 7, missing_id_rate: float = 0.03,
                    return_rate: float = 0.03, promo_share: float = 0.15, n_categories: int = 12,
-                   start: str = "2024-01-01") -> pd.DataFrame:
+                   start: str = "2024-01-01", end: str | None = None) -> pd.DataFrame:
     """Line-item data from a BG/NBD-like process with category preferences, promotions, returns and split receipts."""
     rng = np.random.default_rng(seed)
     k = int(n_categories)
@@ -2051,13 +2025,23 @@ def make_synthetic(n_customers: int = 3000, days: int = 730, seed: int = 7, miss
     pref = rng.dirichlet(np.ones(k) * 0.4, n_customers)
     size_factor = rng.gamma(2.0, 0.8, n_customers)
     t0 = pd.Timestamp(start)
+    # Default end to today to avoid future-dated demo data
+    if end is None:
+        end_ts = pd.Timestamp.now().normalize()
+    else:
+        end_ts = pd.Timestamp(end)
+    max_days = (end_ts - t0).days
+    if max_days <= 0:
+        max_days = days
     rows: list[tuple] = []
     for i in range(n_customers):
-        horizon = days - first[i]
+        horizon = max_days - first[i]
+        if horizon <= 0:
+            continue
         n_buy = int(rng.geometric(p_drop[i]))
         gaps = rng.exponential(1 / lam[i], size=n_buy)
         times = np.concatenate([[0.0], np.cumsum(gaps)]) + first[i]
-        times = times[times < days]
+        times = times[times < max_days]
         for t in times:
             day = t0 + pd.Timedelta(days=int(t))
             n_items = 1 + rng.poisson(size_factor[i])
@@ -2075,7 +2059,7 @@ def make_synthetic(n_customers: int = 3000, days: int = 730, seed: int = 7, miss
                 rows.append((cid, day.strftime("%Y-%m-%d"), tid, pid, f"Product {pid}", depts[c], cats[c], price, qty))
                 if rng.random() < return_rate:
                     rday = day + pd.Timedelta(days=int(rng.integers(1, 15)))
-                    if (rday - t0).days < days:
+                    if (rday - t0).days < max_days:
                         rows.append((cid, rday.strftime("%Y-%m-%d"), tid + "R", pid, f"Product {pid}", depts[c], cats[c], price, -1))
     return pd.DataFrame(rows, columns=REQUIRED)
 

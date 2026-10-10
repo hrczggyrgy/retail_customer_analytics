@@ -79,14 +79,22 @@ import numpy as np
 import pandas as pd
 from scipy import optimize, special, stats
 
+# Use shared ingestion module
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).parent / "src"))
+from retail_customer_analytics.ingestion import (
+    REQUIRED_COLUMNS as COLUMNS,
+    ID_COLUMNS,
+    TEXT_COLUMNS,
+    DATE_FORMATS,
+    parse_dates,
+    load_lines,
+    clean_lines,
+    structural_checks,
+)
+
 LOGGER = logging.getLogger("retail_analysis")
-COLUMNS = ["customer_id", "transaction_date", "transaction_id", "product_id",
-           "product_description", "department", "category", "price", "quantity"]
-ID_COLUMNS = ["customer_id", "transaction_id", "product_id"]
-TEXT_COLUMNS = ["product_description", "department", "category"]
-DATE_FORMATS = ["%Y-%m-%dT%H:%M:%S.%f", "%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%dT%H:%M:%S",
-                "%Y-%m-%d %H:%M:%S", "%Y-%m-%d", "%m/%d/%Y %H:%M:%S", "%m/%d/%Y",
-                "%d/%m/%Y %H:%M:%S", "%d/%m/%Y", "%m-%d-%Y", "%d-%m-%Y"]
 RFM_LABELS = [("Champions", lambda r, f, m: (r >= 4) & (f >= 4) & (m >= 4)),
               ("Frequent / loyal", lambda r, f, m: (r >= 3) & (f >= 4)),
               ("Previously high-value / lapsed", lambda r, f, m: (r <= 2) & (f >= 4) & (m >= 4)),
@@ -166,6 +174,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--max-affinity-baskets", type=int, default=50000)
     p.add_argument("--max-items-per-basket", type=int, default=30)
     p.add_argument("--max-affinity-pair-operations", type=int, default=1_000_000)
+    p.add_argument("--rolling-origins", type=int, default=1, help="Number of rolling-origin validation cutoffs (1 = single holdout)")
+    p.add_argument("--origin-spacing-days", type=int, default=None, help="Days between rolling origins (default: horizon-days)")
     p.add_argument("--log-level", choices=["DEBUG", "INFO", "WARNING", "ERROR"], default="INFO")
     return p
 
@@ -191,107 +201,14 @@ def validate_args(a: argparse.Namespace, p: argparse.ArgumentParser) -> None:
 
 
 # --------------------------------------------------------------------------- #
-# Loading and cleaning
-# --------------------------------------------------------------------------- #
-def parse_dates(raw: pd.Series, date_format: str | None) -> pd.Series:
-    """Coalesce explicit formats; month/day/year is tried before day/month/year."""
-    raw = raw.astype("string").str.strip()
-    out = pd.Series(pd.NaT, index=raw.index, dtype="datetime64[ns]")
-    for fmt_ in dict.fromkeys(([date_format] if date_format else []) + DATE_FORMATS):
-        todo = out.isna() & raw.notna() & (raw != "")
-        if not todo.any():
-            break
-        out.loc[todo] = pd.to_datetime(raw[todo], format=fmt_, errors="coerce")
-    return out
-
-
-def load_lines(path: Path, date_format: str | None) -> tuple[pd.DataFrame, dict[str, Any]]:
-    suffix = path.suffix.lower()
-    if suffix == ".csv":
-        raw = pd.read_csv(path, dtype=str, keep_default_na=False, na_values=["", "NULL", "null"], encoding_errors="replace")
-    elif suffix in {".parquet", ".pq"}:
-        raw = pd.read_parquet(path)
-    else:
-        raise ValueError("input extension must be .csv, .parquet, or .pq")
-    missing = [c for c in COLUMNS if c not in raw.columns]
-    if missing:
-        raise ValueError("input is missing required columns: " + ", ".join(missing))
-    extra = sorted(set(raw.columns) - set(COLUMNS))
-    raw = raw[COLUMNS].copy()
-    df = pd.DataFrame(index=raw.index)
-    for col in ID_COLUMNS + TEXT_COLUMNS:
-        s = raw[col].astype("string").str.strip()
-        s = s.where(s.notna() & (s != ""), other=pd.NA)
-        df[col] = s.astype(object).where(s.notna(), None)
-    present = {c: raw[c].notna() & (raw[c].astype("string").str.strip() != "") for c in ("transaction_date", "price", "quantity")}
-    for col in ("price", "quantity"):
-        v = pd.to_numeric(raw[col], errors="coerce").astype(float)
-        df[col] = v.where(np.isfinite(v))
-    if pd.api.types.is_datetime64_any_dtype(raw["transaction_date"]):
-        dt = pd.to_datetime(raw["transaction_date"], errors="coerce")
-    else:
-        dt = parse_dates(raw["transaction_date"], date_format)
-    df["transaction_date"] = dt
-    df["transaction_day"] = dt.dt.normalize()
-    rev = df["price"] * df["quantity"]
-    df["line_revenue"] = rev.where(np.isfinite(rev))
-    issues = {
-        "missing_customer_id_rows": int(df["customer_id"].isna().sum()),
-        "missing_transaction_id_rows": int(df["transaction_id"].isna().sum()),
-        "missing_product_id_rows": int(df["product_id"].isna().sum()),
-        "missing_category_rows": int(df["category"].isna().sum()),
-        "missing_transaction_date_rows": int((~present["transaction_date"]).sum()),
-        "malformed_transaction_date_rows": int((present["transaction_date"] & dt.isna()).sum()),
-        "missing_price_rows": int(df["price"].isna().sum()),
-        "invalid_price_conversion_rows": int((present["price"] & df["price"].isna()).sum()),
-        "negative_price_rows": int((df["price"] < 0).sum()),
-        "zero_price_rows": int((df["price"] == 0).sum()),
-        "missing_quantity_rows": int(df["quantity"].isna().sum()),
-        "invalid_quantity_conversion_rows": int((present["quantity"] & df["quantity"].isna()).sum()),
-        "negative_quantity_return_rows": int((df["quantity"] < 0).sum()),
-        "zero_quantity_rows": int((df["quantity"] == 0).sum()),
-        "uncomputable_line_revenue_rows": int(df["line_revenue"].isna().sum()),
-        "exact_duplicate_excess_rows": int(df.duplicated(subset=COLUMNS, keep="first").sum()),
-        "ignored_extra_columns": extra,
-    }
-    return df, issues
-
-
-def clean_lines(df: pd.DataFrame, args: argparse.Namespace) -> tuple[pd.DataFrame, dict[str, int]]:
-    removed = {"exact_duplicate_rows_removed": 0, "zero_quantity_rows_removed": 0, "negative_price_rows_removed": 0}
-    if args.drop_exact_duplicates:
-        n = len(df)
-        df = df.drop_duplicates(subset=COLUMNS, keep="first")
-        removed["exact_duplicate_rows_removed"] = n - len(df)
-    if args.exclude_zero_quantity:
-        n = len(df)
-        df = df[df["quantity"].isna() | (df["quantity"] != 0)]
-        removed["zero_quantity_rows_removed"] = n - len(df)
-    if args.exclude_negative_prices:
-        n = len(df)
-        df = df[df["price"].isna() | (df["price"] >= 0)]
-        removed["negative_price_rows_removed"] = n - len(df)
-    return df.reset_index(drop=True), removed
-
-
-def structural_checks(df: pd.DataFrame) -> dict[str, int]:
-    """Identifier-consistency checks that affect analytical validity."""
-    ok = df["customer_id"].notna() & df["transaction_id"].notna()
-    out = {"transaction_ids_used_by_multiple_customers": int((df[ok].groupby("transaction_id")["customer_id"].nunique() > 1).sum()),
-           "customer_transaction_keys_spanning_multiple_days": int(
-               (df[ok & df["transaction_day"].notna()].groupby(["customer_id", "transaction_id"])["transaction_day"].nunique() > 1).sum())}
-    pm = df[df["product_id"].notna()].groupby("product_id")[["department", "category"]].nunique()
-    out["product_ids_with_conflicting_category_or_department"] = int((pm > 1).any(axis=1).sum())
-    return out
-
-
-# --------------------------------------------------------------------------- #
 # Purchase events, returns, price index
 # --------------------------------------------------------------------------- #
 def build_trips(lines: pd.DataFrame, grain: str = "trip") -> pd.DataFrame:
     """Purchase events per customer. grain='trip': one row per customer-day (split receipts merged);
     grain='transaction': one row per (customer_id, transaction_id), dated at its earliest line."""
     cols = ["customer_id", "transaction_day", "trip_value", "n_lines", "n_products", "n_units"]
+    if grain == "transaction":
+        cols = ["customer_id", "transaction_id", "transaction_day", "trip_value", "n_lines", "n_products", "n_units"]
     buys = lines[(lines["quantity"] > 0) & lines["customer_id"].notna() & lines["transaction_day"].notna()]
     if grain == "transaction":
         buys = buys[buys["transaction_id"].notna()]
@@ -460,7 +377,7 @@ def fit_bgnbd(x: np.ndarray, tx: np.ndarray, T: np.ndarray, penalizer: float) ->
         if best is None or res.fun < best.fun:
             best = res
     r, alpha, a, b = np.exp(best.x)
-    return {"r": float(r), "alpha": float(alpha), "a": float(a), "b": float(b), "converged": bool(best.success),
+    return {"status": "fitted", "r": float(r), "alpha": float(alpha), "a": float(a), "b": float(b), "converged": bool(best.success),
             "neg_loglik": float(best.fun), "n_customers": int(len(x))}
 
 
@@ -560,6 +477,105 @@ def _spearman(pred: np.ndarray, y: np.ndarray) -> float | None:
     return float(rho) if np.isfinite(rho) else None
 
 
+def _population_mean_baseline(trips: pd.DataFrame, cut: pd.Timestamp, H: int) -> float:
+    """
+    Estimate population-mean trip count from calibration data ONLY.
+    Uses historical windows of length H before the cutoff to compute
+    the average repeat trips per customer, avoiding any holdout leakage.
+    """
+    # Look at complete historical windows of length H before the cutoff
+    # We use the same logic as customer_table to compute x/T for each customer
+    # and estimate the population mean rate from calibration period data
+    cal_trips = trips[trips["transaction_day"] <= cut]
+    if cal_trips.empty:
+        return 0.0
+    
+    # For each customer, count trips in the H-day window before cutoff
+    window_start = cut - pd.Timedelta(days=H)
+    window_trips = cal_trips[(cal_trips["transaction_day"] > window_start) & (cal_trips["transaction_day"] <= cut)]
+    
+    if window_trips.empty:
+        return 0.0
+    
+    # Mean trips per customer in this historical window
+    customer_trip_counts = window_trips.groupby("customer_id").size()
+    # Include customers with zero trips in the window (they're in cal_trips but not window_trips)
+    all_cal_customers = cal_trips["customer_id"].unique()
+    full_counts = customer_trip_counts.reindex(all_cal_customers, fill_value=0)
+    
+    return float(full_counts.mean())
+
+
+def _compute_metrics(
+    name: str, target: str, pred: np.ndarray, y: np.ndarray, bought: np.ndarray | None = None
+) -> dict[str, Any]:
+    """Compute comprehensive metrics for a model prediction."""
+    ok = np.isfinite(pred)
+    if not ok.any():
+        return {
+            "model": name, "target": target, "n_customers": 0,
+            "mae": None, "rmse": None, "wape": None, "aggregate_bias": None,
+            "spearman": None, "auc_any_purchase": None,
+            "predicted_total": None, "actual_total": None,
+            "mae_ci95_lower": None, "mae_ci95_upper": None,
+        }
+    
+    p = pred[ok]
+    a = y[ok]
+    n = len(p)
+    
+    # Basic metrics
+    mae = float(np.mean(np.abs(p - a)))
+    rmse = float(np.sqrt(np.mean((p - a) ** 2)))
+    
+    # WAPE (Weighted Absolute Percentage Error)
+    denom = np.sum(np.abs(a))
+    wape = float(np.sum(np.abs(p - a)) / denom) if denom > 0 else None
+    
+    # Aggregate bias
+    sum_a = float(np.sum(a))
+    sum_p = float(np.sum(p))
+    aggregate_bias = float((sum_p - sum_a) / sum_a) if sum_a > 0 else None
+    
+    # Spearman correlation
+    spearman = _spearman(p, a)
+    
+    # AUC for binary target
+    auc = None
+    if bought is not None:
+        auc = auc_score(p, bought[ok])
+    
+    # Bootstrap confidence intervals for MAE (simple percentile)
+    mae_ci_lower, mae_ci_upper = None, None
+    if n >= 10:
+        try:
+            n_boot = min(200, n * 2)
+            boot_maes = []
+            for _ in range(n_boot):
+                idx = np.random.choice(n, n, replace=True)
+                boot_maes.append(np.mean(np.abs(p[idx] - a[idx])))
+            mae_ci_lower = float(np.percentile(boot_maes, 2.5))
+            mae_ci_upper = float(np.percentile(boot_maes, 97.5))
+        except Exception:
+            pass
+    
+    return {
+        "model": name,
+        "target": target,
+        "n_customers": int(n),
+        "mae": mae,
+        "rmse": rmse,
+        "wape": wape,
+        "aggregate_bias": aggregate_bias,
+        "spearman": spearman,
+        "auc_any_purchase": auc,
+        "predicted_total": float(p.sum()),
+        "actual_total": float(a.sum()),
+        "mae_ci95_lower": mae_ci_lower,
+        "mae_ci95_upper": mae_ci_upper,
+    }
+
+
 def holdout_validation(trips: pd.DataFrame, as_of: pd.Timestamp, args: argparse.Namespace) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, Any]]:
     """Fit on data up to as_of - horizon; score against the following horizon."""
     H = int(args.horizon_days)
@@ -578,35 +594,34 @@ def holdout_validation(trips: pd.DataFrame, as_of: pd.Timestamp, args: argparse.
     act = hold.groupby("customer_id").agg(actual_trips=("transaction_day", "size"), actual_spend=("trip_value", "sum"))
     d = scored.join(act, how="left").fillna({"actual_trips": 0, "actual_spend": 0.0})
     d["pred_empirical_rate"] = d["x"] / np.maximum(d["T"], 1.0) * H
-    d["pred_constant"] = float(d["actual_trips"].mean())
+    # FIX: Use calibration-period population mean, not holdout mean (prevents leakage)
+    d["pred_constant"] = _population_mean_baseline(trips, cut, H)
     d["pred_revenue_naive"] = d["pred_empirical_rate"] * d["mean_trip_value"]
     y, bought = d["actual_trips"].to_numpy(float), d["actual_trips"].to_numpy(float) > 0
+    
     rows = []
     for name, col in (("BG/NBD", "expected_trips_horizon"), ("empirical_rate_baseline", "pred_empirical_rate"),
                       ("population_mean_baseline", "pred_constant")):
         pred = d[col].to_numpy(float)
-        ok = np.isfinite(pred)
-        rows.append({"model": name, "target": "trips_in_horizon", "n_customers": int(ok.sum()),
-                     "mae": float(np.mean(np.abs(pred[ok] - y[ok]))), "rmse": float(np.sqrt(np.mean((pred[ok] - y[ok]) ** 2))),
-                     "spearman": _spearman(pred[ok], y[ok]), "auc_any_purchase": auc_score(pred[ok], bought[ok]),
-                     "predicted_total": float(pred[ok].sum()), "actual_total": float(y[ok].sum())})
-    rows.append({"model": "legacy_cadence_heuristic", "target": "any_purchase_in_horizon", "n_customers": int(len(d)),
-                 "mae": None, "rmse": None, "spearman": None,
-                 "auc_any_purchase": auc_score((~d["heuristic_inactive_flag"]).to_numpy(float), bought),
-                 "predicted_total": None, "actual_total": float(bought.sum())})
+        rows.append(_compute_metrics(name, "trips_in_horizon", pred, y, bought))
+    
+    rows.append(_compute_metrics(
+        "legacy_cadence_heuristic", "any_purchase_in_horizon",
+        (~d["heuristic_inactive_flag"]).to_numpy(float), y.astype(float), bought
+    ))
+    
     pa = d["p_alive"].to_numpy(float)
     ok = np.isfinite(pa)
-    rows.append({"model": "BG/NBD P(alive)", "target": "any_purchase_in_horizon", "n_customers": int(ok.sum()),
-                 "mae": None, "rmse": None, "spearman": None, "auc_any_purchase": auc_score(pa[ok], bought[ok]),
-                 "predicted_total": None, "actual_total": float(bought[ok].sum())})
+    rows.append(_compute_metrics(
+        "BG/NBD P(alive)", "any_purchase_in_horizon",
+        pa[ok], y[ok].astype(float), bought[ok]
+    ))
+    
     s = d["actual_spend"].to_numpy(float)
     for name, col in (("BG/NBD x Gamma-Gamma", "expected_revenue_horizon"), ("naive_rate_x_mean_value", "pred_revenue_naive")):
         pred = d[col].to_numpy(float)
-        ok = np.isfinite(pred)
-        rows.append({"model": name, "target": "revenue_in_horizon", "n_customers": int(ok.sum()),
-                     "mae": float(np.mean(np.abs(pred[ok] - s[ok]))), "rmse": float(np.sqrt(np.mean((pred[ok] - s[ok]) ** 2))),
-                     "spearman": _spearman(pred[ok], s[ok]), "auc_any_purchase": None,
-                     "predicted_total": float(pred[ok].sum()), "actual_total": float(s[ok].sum())})
+        rows.append(_compute_metrics(name, "revenue_in_horizon", pred, s))
+    
     dd = d[d["expected_trips_horizon"].notna()].copy()
     dd["decile"] = pd.qcut(dd["expected_trips_horizon"].rank(method="first"), 10, labels=False, duplicates="drop") + 1
     calib = (dd.groupby("decile").agg(customers=("actual_trips", "size"), mean_predicted_trips=("expected_trips_horizon", "mean"),
@@ -614,6 +629,133 @@ def holdout_validation(trips: pd.DataFrame, as_of: pd.Timestamp, args: argparse.
                                       mean_p_alive=("p_alive", "mean")).reset_index())
     info.update({"status": "completed", "calibration_customers": int(len(d)), "bgnbd": bg, "gamma_gamma": gg})
     return pd.DataFrame(rows), calib, info
+
+
+def rolling_origin_validation(
+    trips: pd.DataFrame, 
+    as_of: pd.Timestamp, 
+    args: argparse.Namespace,
+    n_origins: int = 4,
+    origin_spacing_days: int | None = None
+) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, Any]]:
+    """
+    Run holdout validation at multiple historical cutoff dates (rolling origins).
+    
+    This provides more robust evidence of model generalization by evaluating
+    at multiple points in time rather than a single holdout.
+    
+    Args:
+        trips: Purchase event DataFrame
+        as_of: Final analysis date (latest cutoff)
+        args: CLI arguments
+        n_origins: Number of historical origins to evaluate (including final)
+        origin_spacing_days: Days between origins (default: horizon_days)
+    
+    Returns:
+        Tuple of (aggregated_metrics, per_origin_details, summary_info)
+    """
+    H = int(args.horizon_days)
+    spacing = origin_spacing_days if origin_spacing_days is not None else H
+    
+    # Generate cutoff dates: as_of, as_of - spacing, as_of - 2*spacing, ...
+    cutoffs = []
+    for i in range(n_origins):
+        cut = as_of - pd.Timedelta(days=i * spacing)
+        # Need enough history before cut: cut - H must be >= min date
+        if trips.empty:
+            break
+        min_date = trips["transaction_day"].min()
+        if pd.isna(min_date) or cut - pd.Timedelta(days=H) <= min_date:
+            continue
+        # Need enough data after cut for evaluation
+        if cut >= as_of:
+            continue
+        cutoffs.append(cut)
+    
+    if len(cutoffs) < 2:
+        # Not enough data for rolling origins, fall back to single holdout
+        return holdout_validation(trips, as_of, args)
+    
+    cutoffs = sorted(cutoffs)  # Oldest first
+    all_metrics = []
+    all_calibs = []
+    origin_infos = []
+    
+    for cut in cutoffs:
+        # Create modified args with this cutoff as the "as_of" for validation
+        eval_horizon = min(H, int((as_of - cut).days))
+        if eval_horizon < H * 0.5:  # Skip if evaluation window too small
+            continue
+            
+        class ModifiedArgs(argparse.Namespace):
+            def __init__(self, base_args, horizon_days):
+                super().__init__(**vars(base_args))
+                self.horizon_days = horizon_days
+        
+        mod_args = ModifiedArgs(args, eval_horizon)
+        
+        metrics, calib, info = holdout_validation(trips, cut, mod_args)
+        if info.get("status") == "completed":
+            # Add origin identifier
+            metrics["origin_cutoff"] = cut.date().isoformat()
+            metrics["origin_eval_horizon"] = eval_horizon
+            calib["origin_cutoff"] = cut.date().isoformat()
+            info["origin_cutoff"] = cut.date().isoformat()
+            info["origin_eval_horizon"] = eval_horizon
+            all_metrics.append(metrics)
+            all_calibs.append(calib)
+            origin_infos.append(info)
+    
+    if not all_metrics:
+        # Fallback
+        return holdout_validation(trips, as_of, args)
+    
+    # Aggregate metrics across origins
+    combined_metrics = pd.concat(all_metrics, ignore_index=True)
+    combined_calib = pd.concat(all_calibs, ignore_index=True)
+    
+    # For report compatibility, return the detailed per-origin metrics
+    # in the format expected by write_report (with n_customers, mae, etc.)
+    detailed_metrics = combined_metrics.copy()
+    
+    # Compute aggregate statistics per model/target across origins
+    agg_rows = []
+    for (model, target), group in combined_metrics.groupby(["model", "target"]):
+        numeric_cols = ["mae", "rmse", "spearman", "auc_any_purchase", "predicted_total", "actual_total", "n_customers"]
+        agg = {}
+        for col in numeric_cols:
+            if col in group.columns:
+                vals = group[col].dropna()
+                if len(vals) > 0:
+                    agg[f"{col}_mean"] = float(vals.mean())
+                    agg[f"{col}_std"] = float(vals.std()) if len(vals) > 1 else 0.0
+                    agg[f"{col}_min"] = float(vals.min())
+                    agg[f"{col}_max"] = float(vals.max())
+                    agg[f"n_origins"] = len(vals)
+        
+        agg_rows.append({
+            "model": model,
+            "target": target,
+            **agg
+        })
+    
+    agg_metrics = pd.DataFrame(agg_rows)
+    
+    # Summary info - include fields expected by report generation
+    final_cutoff = cutoffs[-1] if cutoffs else (as_of - pd.Timedelta(days=H))
+    summary_info = {
+        "status": "completed",
+        "n_origins": len(origin_infos),
+        "origins": [{"cutoff": o["origin_cutoff"], "eval_horizon": o["origin_eval_horizon"], "calibration_customers": o.get("calibration_customers", 0)} for o in origin_infos],
+        "horizon_days": H,
+        "as_of_date": as_of.date().isoformat(),
+        "cutoff_date": final_cutoff.date().isoformat(),  # For report compatibility
+        "final_cutoff": final_cutoff.date().isoformat(),
+        "calibration_customers": int(origin_infos[-1].get("calibration_customers", 0)) if origin_infos else 0,
+    }
+    
+    # Return detailed per-origin metrics for report, aggregated for analysis
+    return detailed_metrics, combined_calib, summary_info
 
 
 # --------------------------------------------------------------------------- #
@@ -782,6 +924,174 @@ def cluster_customers(c: pd.DataFrame, pcs: np.ndarray, args: argparse.Namespace
     prof["cluster_label"] = prof["cluster_id"].map(labels)
     prof["share_of_customers"] = prof["customers"] / len(c)
     return c, diag, prof
+
+
+def compare_rfm_vs_cluster(c: pd.DataFrame) -> pd.DataFrame:
+    """
+    Compare RFM segments with cluster assignments.
+    
+    Returns a crosstab showing how RFM segments map to clusters,
+    plus summary statistics for each combination.
+    """
+    if "rfm_segment" not in c.columns or "cluster_label" not in c.columns:
+        return pd.DataFrame()
+    
+    # Cross-tabulation
+    crosstab = pd.crosstab(c["rfm_segment"], c["cluster_label"], margins=True)
+    crosstab.columns = [str(x) for x in crosstab.columns]
+    crosstab.index = [str(x) for x in crosstab.index]
+    
+    # Row/column percentages
+    total = len(c)
+    row_pct = crosstab.div(crosstab["All"], axis=0) * 100
+    col_pct = crosstab.div(crosstab.loc["All"], axis=1) * 100
+    
+    # Build detailed comparison
+    rows = []
+    for rfm_seg in c["rfm_segment"].unique():
+        if rfm_seg == "All" or pd.isna(rfm_seg):
+            continue
+        for clust in c["cluster_label"].unique():
+            if clust == "All" or pd.isna(clust):
+                continue
+            mask = (c["rfm_segment"] == rfm_seg) & (c["cluster_label"] == clust)
+            n = int(mask.sum())
+            if n == 0:
+                continue
+            sub = c[mask]
+            rows.append({
+                "rfm_segment": rfm_seg,
+                "cluster_label": clust,
+                "n_customers": n,
+                "pct_of_rfm": n / (c["rfm_segment"] == rfm_seg).sum() * 100,
+                "pct_of_cluster": n / (c["cluster_label"] == clust).sum() * 100,
+                "median_recency": float(sub["recency_days"].median()) if "recency_days" in sub.columns else np.nan,
+                "median_p_alive": float(sub["p_alive"].median()) if "p_alive" in sub.columns else np.nan,
+                "median_expected_revenue": float(sub["expected_revenue_horizon"].median()) if "expected_revenue_horizon" in sub.columns else np.nan,
+                "repeat_rate": float((sub["n_trips"] >= 2).mean()) if "n_trips" in sub.columns else np.nan,
+            })
+    
+    return pd.DataFrame(rows)
+
+
+def cluster_stability_across_snapshots(
+    lines: pd.DataFrame,
+    snapshots: list[pd.Timestamp],
+    args: argparse.Namespace,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Run clustering at multiple snapshot dates and measure stability.
+    
+    Returns:
+        - stability_metrics: ARI and label agreement between consecutive snapshots
+        - cluster_labels_per_snapshot: cluster assignments for each snapshot
+    """
+    from retail_customer_analytics.features import build_customer_snapshot
+    
+    all_labels = {}
+    all_profiles = {}
+    
+    for snap in snapshots:
+        # Build features at this snapshot
+        cust = build_customer_snapshot(
+            transactions=lines,
+            as_of=snap,
+            event_grain=args.frequency_grain,
+            windows_days=args.windows_days,
+            recent_window_days=args.recent_window_days,
+        )
+        if len(cust) < 50:
+            continue
+        
+        # Score customers
+        from retail_customer_analysis import score_customers, assign_rfm
+        cust, bg, gg = score_customers(cust, args.horizon_days, args)
+        cust = assign_rfm(cust)
+        
+        # Cluster
+        try:
+            pcs = top_components(category_mix(lines, cust.index, snap, args.max_clr_categories)[0])
+            cust, diag, prof = cluster_customers(cust, pcs, args)
+            
+            # Get selected k
+            selected = diag[diag["selected"]]
+            if len(selected) == 0:
+                continue
+            best_k = int(selected.iloc[0]["candidate_k"])
+            
+            # Save labels
+            all_labels[snap] = cust[["cluster_id", "cluster_label"]].copy().reset_index()
+            all_labels[snap]["snapshot"] = snap
+            all_profiles[snap] = prof
+            
+        except Exception as e:
+            LOGGER.warning(f"Clustering failed at snapshot {snap}: {e}")
+            continue
+    
+    if len(all_labels) < 2:
+        return pd.DataFrame(), pd.DataFrame()
+    
+    # Compare consecutive snapshots
+    snapshots_sorted = sorted(all_labels.keys())
+    stability_rows = []
+    label_dfs = []
+    
+    for i in range(1, len(snapshots_sorted)):
+        snap_prev = snapshots_sorted[i-1]
+        snap_curr = snapshots_sorted[i]
+        
+        labels_prev = all_labels[snap_prev].set_index("customer_id")
+        labels_curr = all_labels[snap_curr].set_index("customer_id")
+        
+        # Common customers
+        common = labels_prev.index.intersection(labels_curr.index)
+        if len(common) < 20:
+            continue
+        
+        # Adjusted Rand Index
+        ari = adjusted_rand(
+            labels_prev.loc[common, "cluster_id"].to_numpy(),
+            labels_curr.loc[common, "cluster_id"].to_numpy()
+        )
+        
+        # Label agreement (exact match)
+        agreement = (labels_prev.loc[common, "cluster_id"] == labels_curr.loc[common, "cluster_id"]).mean()
+        
+        # Cluster-level stability
+        stability_rows.append({
+            "snapshot_prev": snap_prev.date().isoformat(),
+            "snapshot_curr": snap_curr.date().isoformat(),
+            "n_common_customers": len(common),
+            "ari": float(ari),
+            "label_agreement": float(agreement),
+            "n_clusters_prev": labels_prev["cluster_id"].nunique(),
+            "n_clusters_curr": labels_curr["cluster_id"].nunique(),
+        })
+        
+        # Per-cluster tracking
+        for cl in sorted(labels_curr.loc[common, "cluster_id"].unique()):
+            curr_mask = labels_curr.loc[common, "cluster_id"] == cl
+            if not curr_mask.any():
+                continue
+            common_in_cl = common[curr_mask]
+            if len(common_in_cl) == 0:
+                continue
+            prev_labels = labels_prev.loc[common_in_cl, "cluster_id"]
+            # Most common previous cluster
+            prev_mode = prev_labels.mode()
+            stability_rows.append({
+                "snapshot_prev": snap_prev.date().isoformat(),
+                "snapshot_curr": snap_curr.date().isoformat(),
+                "cluster_curr": int(cl),
+                "n_customers": int(curr_mask.sum()),
+                "prev_cluster_mode": int(prev_mode.iloc[0]) if len(prev_mode) > 0 else None,
+                "stability_pct": float((prev_labels == prev_mode.iloc[0]).mean()) if len(prev_mode) > 0 else 0.0,
+            })
+    
+    stability_df = pd.DataFrame(stability_rows)
+    labels_df = pd.concat(all_labels.values(), ignore_index=True) if all_labels else pd.DataFrame()
+    
+    return stability_df, labels_df
 
 
 # --------------------------------------------------------------------------- #
@@ -1312,7 +1622,14 @@ def run_analysis(args: argparse.Namespace) -> int:
     else:
         LOGGER.info("Validating models on a time-based holdout")
         try:
-            val_metrics, val_calib, val_info = holdout_validation(trips, as_of, args)
+            if getattr(args, "rolling_origins", 1) > 1:
+                val_metrics, val_calib, val_info = rolling_origin_validation(
+                    trips, as_of, args, 
+                    n_origins=args.rolling_origins,
+                    origin_spacing_days=args.origin_spacing_days
+                )
+            else:
+                val_metrics, val_calib, val_info = holdout_validation(trips, as_of, args)
         except Exception as exc:
             val_info = {"status": "failed", "reason": f"{type(exc).__name__}: {exc}"}
             skipped.append({"analysis": "holdout validation", "reason": val_info["reason"]})
@@ -1330,6 +1647,28 @@ def run_analysis(args: argparse.Namespace) -> int:
         except Exception as exc:
             skipped.append({"analysis": "clustering", "reason": f"{type(exc).__name__}: {exc}"})
             cluster_diag = pd.DataFrame([{"status": "failed", "reason": str(exc), "selected": False}])
+        
+        # RFM vs Cluster comparison
+        rfm_cluster_comparison = compare_rfm_vs_cluster(cust) if len(cust) else pd.DataFrame()
+        
+        # Cross-snapshot clustering stability (if enough history)
+        cluster_stability = pd.DataFrame()
+        cluster_labels_snapshots = pd.DataFrame()
+        if not trips.empty and trips["transaction_day"].nunique() >= 3:
+            # Generate quarterly snapshots
+            max_date = trips["transaction_day"].max()
+            min_date = trips["transaction_day"].min()
+            if (max_date - min_date).days >= 180:  # Need at least 6 months
+                snapshot_dates = pd.date_range(min_date + pd.Timedelta(days=90), max_date - pd.Timedelta(days=args.horizon_days), freq="QE")
+                if len(snapshot_dates) >= 2:
+                    try:
+                        cluster_stability, cluster_labels_snapshots = cluster_stability_across_snapshots(
+                            lines, snapshot_dates.tolist(), args
+                        )
+                    except Exception as exc:
+                        LOGGER.warning(f"Cross-snapshot clustering stability failed: {exc}")
+                        cluster_stability = pd.DataFrame()
+        
         surv, cohort_info = repeat_survival(trips, as_of, args.burn_in_days)
         retention = cohort_retention(trips, cohort_info, as_of)
         ipt = interpurchase_table(trips, as_of)
@@ -1359,6 +1698,7 @@ def run_analysis(args: argparse.Namespace) -> int:
     tables = [("data_quality_issues", issue_table), ("customer_features", cust.reset_index() if len(cust) else cust),
               ("holdout_metrics", val_metrics), ("holdout_calibration", val_calib), ("model_parameters", pd.DataFrame(model_rows)),
               ("cluster_diagnostics", cluster_diag), ("cluster_profiles", cluster_prof), ("rfm_segment_profiles", rfm_prof),
+              ("rfm_cluster_comparison", rfm_cluster_comparison), ("cluster_stability", cluster_stability), ("cluster_labels_snapshots", cluster_labels_snapshots),
               ("repeat_survival", surv), ("cohort_retention_new_customers", retention), ("interpurchase_intervals", ipt),
               ("basket_affinity", aff), ("next_trip_affinity", nxt),
               ("customer_revenue_concentration", revenue_concentration(cust) if len(cust) else empty),
