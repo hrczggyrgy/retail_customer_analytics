@@ -267,16 +267,23 @@ def _return_features(
     index: pd.Index,
     as_of: pd.Timestamp,
 ) -> pd.DataFrame:
-    """Return value ratio, return-unit ratio, unmatched return share."""
+    """Return value ratio, return-unit ratio, unmatched return share.
+    
+    Return value ratio = return_value / gross_purchase_revenue (when gross > 0).
+    Return unit ratio = return_units / gross_purchase_units (when gross > 0).
+    """
     f = pd.DataFrame(index=index)
     
     # Match returns to purchases (same logic as in retail_customer_analysis)
+    has_timestamps = "transaction_date" in transactions.columns and transactions["transaction_date"].notna().any()
+    time_col = "transaction_date" if has_timestamps else "transaction_day"
+    
     ret = transactions[
         (transactions["quantity"] < 0) 
         & transactions["customer_id"].notna() 
         & transactions["product_id"].notna()
-        & transactions["transaction_day"].notna()
-        & (transactions["transaction_day"] <= as_of)
+        & transactions[time_col].notna()
+        & (transactions[time_col] <= as_of)
     ].copy()
     
     if ret.empty:
@@ -291,40 +298,49 @@ def _return_features(
         (transactions["quantity"] > 0) 
         & transactions["customer_id"].notna() 
         & transactions["product_id"].notna()
-        & transactions["transaction_day"].notna()
-        & (transactions["transaction_day"] <= as_of)
-    ][["customer_id", "product_id", "transaction_day"]].drop_duplicates()
-    buys = buys.rename(columns={"transaction_day": "purchase_day"}).sort_values("purchase_day")
+        & transactions[time_col].notna()
+        & (transactions[time_col] <= as_of)
+    ][["customer_id", "product_id", time_col]].drop_duplicates()
+    buys = buys.rename(columns={time_col: "purchase_time"}).sort_values("purchase_time")
     
     merged = pd.merge_asof(
-        ret.sort_values("transaction_day"), 
+        ret.sort_values(time_col), 
         buys, 
-        left_on="transaction_day", 
-        right_on="purchase_day",
+        left_on=time_col, 
+        right_on="purchase_time",
         by=["customer_id", "product_id"], 
         direction="backward"
     )
-    merged["matched"] = merged["purchase_day"].notna()
+    merged["matched"] = merged["purchase_time"].notna()
     
     rv = (-merged["line_revenue"]).clip(lower=0).fillna(0.0)
     
     f["return_value"] = rv.groupby(merged["customer_id"]).sum().reindex(index).fillna(0.0)
     um = ~merged["matched"]
     f["unmatched_return_value"] = rv[um].groupby(merged.loc[um, "customer_id"]).sum().reindex(index).fillna(0.0)
-    f["return_value_ratio"] = (f["return_value"] / f["return_value"].where(f["return_value"] > 0, np.inf)).clip(0, 1)
+    
+    # Gross purchase revenue per customer (positive quantity only)
+    gross_rev = transactions[
+        (transactions["quantity"] > 0) 
+        & transactions["customer_id"].notna() 
+        & (transactions[time_col] <= as_of)
+    ].groupby("customer_id")["line_revenue"].sum()
+    f["gross_purchase_revenue"] = gross_rev.reindex(index).fillna(0.0)
+    
+    # Return value ratio = return_value / gross_purchase_revenue
+    f["return_value_ratio"] = (f["return_value"] / f["gross_purchase_revenue"]).where(f["gross_purchase_revenue"] > 0).clip(0, 1).fillna(0.0)
     
     # Return unit ratio
     ret_units = (-merged["quantity"]).clip(lower=0).fillna(0).astype(int)
     f["return_units"] = ret_units.groupby(merged["customer_id"]).sum().reindex(index).fillna(0).astype(int)
-    buy_units = merged["quantity"].clip(lower=0).fillna(0).astype(int)  # This won't work directly
     
-    # Simplified: use total positive quantity as denominator
-    pos_qty = transactions[
+    # Gross purchase units per customer
+    gross_units = transactions[
         (transactions["quantity"] > 0) 
         & transactions["customer_id"].notna() 
-        & (transactions["transaction_day"] <= as_of)
+        & (transactions[time_col] <= as_of)
     ].groupby("customer_id")["quantity"].sum()
-    f["return_unit_ratio"] = (f["return_units"] / pos_qty.reindex(index).fillna(0)).clip(0, 1)
+    f["return_unit_ratio"] = (f["return_units"] / gross_units.reindex(index).fillna(0)).clip(0, 1).fillna(0.0)
     
     # Unmatched share
     f["unmatched_return_share"] = (

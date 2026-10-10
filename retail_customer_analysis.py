@@ -225,26 +225,40 @@ def build_trips(lines: pd.DataFrame, grain: str = "trip") -> pd.DataFrame:
 
 
 def match_returns(lines: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, Any]]:
-    """Link each return line to the latest earlier (or same-day) purchase of the same customer and product."""
+    """Link each return line to the latest earlier purchase of the same customer and product.
+    
+    Uses full transaction_date timestamps when available for precise ordering.
+    Falls back to transaction_day (calendar day) when timestamps are not available.
+    """
+    # Determine which timestamp column to use for matching
+    has_timestamps = "transaction_date" in lines.columns and lines["transaction_date"].notna().any()
+    time_col = "transaction_date" if has_timestamps else "transaction_day"
+    
     ret = lines[(lines["quantity"] < 0) & lines["customer_id"].notna() & lines["product_id"].notna()
-                & lines["transaction_day"].notna()].copy()
+                & lines[time_col].notna()].copy()
     info: dict[str, Any] = {"return_lines": int(len(ret)), "matched_return_lines": 0,
-                            "matched_return_value_share": None, "median_days_to_return": None}
+                            "matched_return_value_share": None, "median_days_to_return": None,
+                            "matching_precision": "timestamp" if has_timestamps else "calendar_day"}
     if ret.empty:
         ret["matched"] = pd.Series(dtype=bool)
         return ret, info
     buys = (lines[(lines["quantity"] > 0) & lines["customer_id"].notna() & lines["product_id"].notna()
-                  & lines["transaction_day"].notna()][["customer_id", "product_id", "transaction_day"]]
-            .drop_duplicates().rename(columns={"transaction_day": "purchase_day"}).sort_values("purchase_day"))
-    merged = pd.merge_asof(ret.sort_values("transaction_day"), buys, left_on="transaction_day", right_on="purchase_day",
+                  & lines[time_col].notna()][["customer_id", "product_id", time_col]]
+            .drop_duplicates().rename(columns={time_col: "purchase_time"}).sort_values("purchase_time"))
+    merged = pd.merge_asof(ret.sort_values(time_col), buys, left_on=time_col, right_on="purchase_time",
                            by=["customer_id", "product_id"], direction="backward")
-    merged["matched"] = merged["purchase_day"].notna()
+    merged["matched"] = merged["purchase_time"].notna()
     value = (-merged["line_revenue"]).clip(lower=0).fillna(0.0)
     info["matched_return_lines"] = int(merged["matched"].sum())
     total = float(value.sum())
     info["matched_return_value_share"] = float(value[merged["matched"]].sum() / total) if total > 0 else None
     if merged["matched"].any():
-        info["median_days_to_return"] = float((merged["transaction_day"] - merged["purchase_day"]).dt.days[merged["matched"]].median())
+        delta = merged[time_col] - merged["purchase_time"]
+        if has_timestamps:
+            # Return difference in days with fractional precision
+            info["median_days_to_return"] = float(delta.dt.total_seconds()[merged["matched"]].median() / 86400)
+        else:
+            info["median_days_to_return"] = float(delta.dt.days[merged["matched"]].median())
     return merged, info
 
 
@@ -436,25 +450,67 @@ def gamma_gamma_predict(par: dict[str, Any], n: np.ndarray, mbar: np.ndarray) ->
 
 
 def score_customers(c: pd.DataFrame, horizon: float, args: argparse.Namespace) -> tuple[pd.DataFrame, dict[str, Any], dict[str, Any]]:
-    """Fit both models and attach P(alive), expected trips, expected trip value and horizon revenue."""
+    """Fit both models and attach P(alive), expected trips, expected trip value and horizon revenue.
+    
+    Returns customer DataFrame with prediction_source column indicating:
+    - 'bgnbd_fitted': BG/NBD fitted and prediction used
+    - 'bgnbd_fallback': BG/NBD failed, used empirical rate fallback
+    - 'gg_fitted': Gamma-Gamma fitted
+    - 'gg_fallback': Gamma-Gamma failed/skipped, used observed mean
+    """
     c = c.copy()
     x, tx, T = c["x"].to_numpy(float), c["t_x"].to_numpy(float), c["T"].to_numpy(float)
+    
+    # BG/NBD fitting
+    bgnbd_status = "fitted"
+    bgnbd_converged = False
     try:
         if len(c) < 50:
             raise ValueError(f"only {len(c)} customers; BG/NBD needs at least 50")
         bg = fit_bgnbd(x, tx, T, args.penalizer)
-        bg["status"] = "fitted"
+        if not bg.get("converged", False):
+            bgnbd_converged = False
+            LOGGER.warning("BG/NBD optimizer did not converge; treating as fallback")
+            raise ValueError("BG/NBD did not converge")
+        bgnbd_converged = True
         p_alive, exp_trips = bgnbd_predict(bg, x, tx, T, float(horizon))
-    except Exception as exc:  # fall back to empirical rates so downstream steps still run
+    except Exception as exc:
         LOGGER.warning("BG/NBD not fitted (%s); using empirical rates", exc)
-        bg = {"status": "failed", "reason": str(exc)}
+        bg = {"status": "failed", "reason": str(exc), "converged": False}
+        bgnbd_status = "failed"
         p_alive, exp_trips = np.full(len(c), np.nan), np.full(len(c), np.nan)
+    
+    # Determine prediction source for each customer
     c["p_alive"] = p_alive
-    c["expected_trips_horizon"] = np.where(np.isfinite(exp_trips), exp_trips, x / np.maximum(T, 1.0) * horizon)
+    bgnbd_finite = np.isfinite(exp_trips)
+    c["expected_trips_horizon"] = np.where(bgnbd_finite, exp_trips, x / np.maximum(T, 1.0) * horizon)
+    c["prediction_source_bgnbd"] = np.where(bgnbd_finite, "bgnbd_fitted", "bgnbd_fallback")
+    
+    # Gamma-Gamma fitting
     n, m = c["n_trips"].to_numpy(float), c["mean_trip_value"].to_numpy(float)
     gg = fit_gamma_gamma(n, m, args.penalizer)
+    
+    if gg.get("status") == "fitted" and gg.get("converged", False):
+        gg_status = "fitted"
+        gg_converged = True
+    else:
+        gg_status = "fallback"
+        gg_converged = False
+        if gg.get("status") == "skipped":
+            gg_status = "skipped"
+    
     c["expected_trip_value"] = gamma_gamma_predict(gg, n, m)
     c["expected_revenue_horizon"] = c["expected_trips_horizon"] * c["expected_trip_value"]
+    c["prediction_source_gg"] = np.where(
+        np.isfinite(c["expected_trip_value"]) & gg_converged, "gg_fitted", "gg_fallback"
+    )
+    
+    # Add model status summary
+    bg["status"] = bgnbd_status
+    bg["converged"] = bgnbd_converged
+    gg["status"] = gg_status
+    gg["converged"] = gg_converged
+    
     return c, bg, gg
 
 
@@ -507,7 +563,8 @@ def _population_mean_baseline(trips: pd.DataFrame, cut: pd.Timestamp, H: int) ->
 
 
 def _compute_metrics(
-    name: str, target: str, pred: np.ndarray, y: np.ndarray, bought: np.ndarray | None = None
+    name: str, target: str, pred: np.ndarray, y: np.ndarray, bought: np.ndarray | None = None,
+    seed: int | None = None
 ) -> dict[str, Any]:
     """Compute comprehensive metrics for a model prediction."""
     ok = np.isfinite(pred)
@@ -518,6 +575,7 @@ def _compute_metrics(
             "spearman": None, "auc_any_purchase": None,
             "predicted_total": None, "actual_total": None,
             "mae_ci95_lower": None, "mae_ci95_upper": None,
+            "bootstrap_seed": seed,
         }
     
     p = pred[ok]
@@ -550,9 +608,10 @@ def _compute_metrics(
     if n >= 10:
         try:
             n_boot = min(200, n * 2)
+            rng = np.random.default_rng(seed)
             boot_maes = []
             for _ in range(n_boot):
-                idx = np.random.choice(n, n, replace=True)
+                idx = rng.choice(n, n, replace=True)
                 boot_maes.append(np.mean(np.abs(p[idx] - a[idx])))
             mae_ci_lower = float(np.percentile(boot_maes, 2.5))
             mae_ci_upper = float(np.percentile(boot_maes, 97.5))
@@ -573,6 +632,7 @@ def _compute_metrics(
         "actual_total": float(a.sum()),
         "mae_ci95_lower": mae_ci_lower,
         "mae_ci95_upper": mae_ci_upper,
+        "bootstrap_seed": seed,
     }
 
 
@@ -600,27 +660,31 @@ def holdout_validation(trips: pd.DataFrame, as_of: pd.Timestamp, args: argparse.
     y, bought = d["actual_trips"].to_numpy(float), d["actual_trips"].to_numpy(float) > 0
     
     rows = []
+    # Use random seed for reproducible bootstrap CIs
+    metrics_seed = args.random_seed
     for name, col in (("BG/NBD", "expected_trips_horizon"), ("empirical_rate_baseline", "pred_empirical_rate"),
                       ("population_mean_baseline", "pred_constant")):
         pred = d[col].to_numpy(float)
-        rows.append(_compute_metrics(name, "trips_in_horizon", pred, y, bought))
+        rows.append(_compute_metrics(name, "trips_in_horizon", pred, y, bought, seed=metrics_seed))
     
+    # Binary target: any purchase in horizon (0/1)
+    # Use bought (boolean) as actual, not y (count)
     rows.append(_compute_metrics(
         "legacy_cadence_heuristic", "any_purchase_in_horizon",
-        (~d["heuristic_inactive_flag"]).to_numpy(float), y.astype(float), bought
+        (~d["heuristic_inactive_flag"]).to_numpy(float), bought.astype(float), bought, seed=metrics_seed
     ))
     
     pa = d["p_alive"].to_numpy(float)
     ok = np.isfinite(pa)
     rows.append(_compute_metrics(
         "BG/NBD P(alive)", "any_purchase_in_horizon",
-        pa[ok], y[ok].astype(float), bought[ok]
+        pa[ok], bought[ok].astype(float), bought[ok], seed=metrics_seed
     ))
     
     s = d["actual_spend"].to_numpy(float)
     for name, col in (("BG/NBD x Gamma-Gamma", "expected_revenue_horizon"), ("naive_rate_x_mean_value", "pred_revenue_naive")):
         pred = d[col].to_numpy(float)
-        rows.append(_compute_metrics(name, "revenue_in_horizon", pred, s))
+        rows.append(_compute_metrics(name, "revenue_in_horizon", pred, s, seed=metrics_seed))
     
     dd = d[d["expected_trips_horizon"].notna()].copy()
     dd["decile"] = pd.qcut(dd["expected_trips_horizon"].rank(method="first"), 10, labels=False, duplicates="drop") + 1
@@ -1634,10 +1698,16 @@ def run_analysis(args: argparse.Namespace) -> int:
             val_info = {"status": "failed", "reason": f"{type(exc).__name__}: {exc}"}
             skipped.append({"analysis": "holdout validation", "reason": val_info["reason"]})
         LOGGER.info("Fitting final customer models")
-        cust = customer_table(trips, as_of, args)
-        cust = add_returns_and_promo(cust, lines, matched, as_of, price_info["usable"])
-        cust = cust.join(window_features(lines, trips, cust.index, as_of, args.windows_days, args.recent_window_days))
-        cust = cust.join(breadth_features(lines, cust.index, as_of))
+        # Use canonical feature builder (includes all feature families: rolling, breadth, returns, promo, category affinity, trends, basket)
+        from retail_customer_analytics.features import build_customer_snapshot
+        cust = build_customer_snapshot(
+            transactions=lines,
+            as_of=as_of,
+            event_grain=args.frequency_grain,
+            windows_days=args.windows_days,
+            recent_window_days=args.recent_window_days,
+        )
+        # Score with probabilistic models
         cust, bg, gg = score_customers(cust, args.horizon_days, args)
         cust = assign_rfm(cust)
         pcs = top_components(category_mix(lines, cust.index, as_of, args.max_clr_categories)[0])

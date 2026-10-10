@@ -127,10 +127,52 @@ class TestMatchReturns:
         assert ret_row["purchase_day"].iloc[0] == pd.Timestamp("2024-01-10")
 
     def test_return_not_matched_to_later_same_day_purchase(self):
-        """Return should NOT be matched to a purchase on the SAME day that occurs LATER (when timestamps available)."""
-        # Note: Current implementation uses transaction_day (normalized date), so same-day
-        # returns may match to same-day purchases. This test documents current behavior.
-        # The fix for R04 would require timestamp precision.
+        """Return should NOT be matched to a purchase on the SAME day that occurs LATER when timestamps available."""
+        # With full timestamps: purchase at 14:00, return at 10:00 (earlier same day)
+        # Should NOT match because return happened BEFORE purchase
+        lines = pd.DataFrame({
+            "customer_id": ["C1", "C1"],
+            "product_id": ["P1", "P1"],
+            "transaction_date": pd.to_datetime(["2024-01-15 14:00:00", "2024-01-15 10:00:00"]),
+            "transaction_day": pd.to_datetime(["2024-01-15", "2024-01-15"]),  # Normalized day
+            "transaction_id": ["T1", "T2"],
+            "quantity": [1, -1],
+            "price": [10.0, 10.0],
+            "line_revenue": [10.0, -10.0],
+        })
+        
+        matched, info = rca.match_returns(lines)
+        
+        # With timestamps, return at 10:00 should NOT match to purchase at 14:00 (later same day)
+        ret_row = matched[matched["transaction_id"] == "T2"]
+        assert len(ret_row) == 1
+        assert ret_row["matched"].iloc[0] == False
+        assert info["matching_precision"] == "timestamp"
+
+    def test_return_matched_to_earlier_same_day_purchase(self):
+        """Return SHOULD be matched to a purchase on the SAME day that occurs EARLIER when timestamps available."""
+        # Purchase at 10:00, return at 14:00 (later same day) - should match
+        lines = pd.DataFrame({
+            "customer_id": ["C1", "C1"],
+            "product_id": ["P1", "P1"],
+            "transaction_date": pd.to_datetime(["2024-01-15 10:00:00", "2024-01-15 14:00:00"]),
+            "transaction_day": pd.to_datetime(["2024-01-15", "2024-01-15"]),
+            "transaction_id": ["T1", "T2"],
+            "quantity": [1, -1],
+            "price": [10.0, 10.0],
+            "line_revenue": [10.0, -10.0],
+        })
+        
+        matched, info = rca.match_returns(lines)
+        
+        # With timestamps, return at 14:00 should match to purchase at 10:00 (earlier same day)
+        ret_row = matched[matched["transaction_id"] == "T2"]
+        assert len(ret_row) == 1
+        assert ret_row["matched"].iloc[0] == True
+        assert info["matching_precision"] == "timestamp"
+
+    def test_return_fallback_to_calendar_day_when_no_timestamps(self):
+        """Without timestamps, falls back to calendar-day matching (may match same-day)."""
         lines = pd.DataFrame({
             "customer_id": ["C1", "C1"],
             "product_id": ["P1", "P1"],
@@ -143,12 +185,11 @@ class TestMatchReturns:
         
         matched, info = rca.match_returns(lines)
         
-        # Current behavior: matches on same day (using normalized date)
-        # TODO: R04 fix - when timestamps available, should not match to later same-day purchase
+        # Without timestamps, matches on calendar day
         ret_row = matched[matched["transaction_id"] == "T2"]
         assert len(ret_row) == 1
-        # Currently matches because same transaction_day
         assert ret_row["matched"].iloc[0] == True
+        assert info["matching_precision"] == "calendar_day"
 
     def test_return_unmatched_when_no_earlier_purchase(self):
         """Return with no earlier purchase should be unmatched."""
