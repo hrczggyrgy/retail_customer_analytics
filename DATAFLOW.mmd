@@ -2,125 +2,125 @@ flowchart TD
     %% ============================================================
     %% INPUT LAYER
     %% ============================================================
-    subgraph INPUT [INPUT LAYER]
-        RAW["Raw CSV/Parquet\n(customer_id, transaction_date, transaction_id,\n product_id, product_description, department,\n category, price, quantity)"]
-        VALIDATE["ingestion.load_lines()\n+ parse_dates()\n+ structural_checks()"]
-        CLEAN["ingestion.clean_lines()\n(drop_exact_duplicates,\n exclude_zero_quantity,\n exclude_negative_prices)"]
-        NORMALIZE["ingestion.prepare_transaction_frame()\n→ Normalized DataFrame\n+ transaction_day, line_revenue,\n  revenue columns"]
+    subgraph INPUT["INPUT LAYER"]
+        RAW["Raw CSV/Parquet<br/>(customer_id, transaction_date, transaction_id,<br/> product_id, product_description, department,<br/> category, price, quantity)"]
+        VALIDATE["ingestion.load_lines()<br/>+ parse_dates()<br/>+ structural_checks()"]
+        CLEAN["ingestion.clean_lines()<br/>(drop_exact_duplicates,<br/> exclude_zero_quantity,<br/> exclude_negative_prices)"]
+        NORMALIZE["ingestion.prepare_transaction_frame()<br/>→ Normalized DataFrame<br/>+ transaction_day, line_revenue,<br/>  revenue columns"]
     end
 
     %% ============================================================
     %% SHARED CANONICAL MODULES
     %% ============================================================
-    subgraph SHARED [SHARED CANONICAL MODULES (src/retail_customer_analytics)]
-        subgraph EVENTS [events.py — Canonical Event Construction]
-            EVT_CONFIG["EventConfig\n(basket_grain, transaction_key_mode)"]
-            BUILD_TRIPS["build_purchase_events()\n→ trips: customer_id, transaction_day,\n  trip_value, n_lines, n_products, n_units"]
-            BUILD_BASKETS["build_baskets()\n→ baskets: customer_id, basket_key, items[]"]
-            MATCH_RETURNS["match_returns()\n→ matched_returns + diagnostics"]
-            PRICE_INDEX["add_price_index()\n→ reference_price, price_index, promo_like"]
+    subgraph SHARED["SHARED CANONICAL MODULES (src/retail_customer_analytics)"]
+        subgraph EVENTS["events.py — Canonical Event Construction"]
+            EVT_CONFIG["EventConfig<br/>(basket_grain, transaction_key_mode)"]
+            BUILD_TRIPS["build_purchase_events()<br/>→ trips: customer_id, transaction_day,<br/>  trip_value, n_lines, n_products, n_units"]
+            BUILD_BASKETS["build_baskets()<br/>→ baskets: customer_id, basket_key, items[]"]
+            MATCH_RETURNS["match_returns()<br/>→ matched_returns + diagnostics"]
+            PRICE_INDEX["add_price_index()<br/>→ reference_price, price_index, promo_like"]
         end
 
-        subgraph AFFINITY [affinity.py — Bounded Basket Affinity]
-            AFF_CONFIG["AffinityConfig\n(max_candidates, max_baskets,\n max_items_per_basket, max_pair_operations,\n min_customers, random_seed)"]
-            ANALYZE_AFF["analyze_affinity()\n→ AffinityResult:\n  - associations (pairs)\n  - transitions (next-trip)\n  - diagnostics (status, budgets, coverage)"]
-            ANALYZE_APP["analyze_affinity_from_app()\n→ Streamlit-compatible dict"]
+        subgraph AFFINITY["affinity.py — Bounded Basket Affinity"]
+            AFF_CONFIG["AffinityConfig<br/>(max_candidates, max_baskets,<br/> max_items_per_basket, max_pair_operations,<br/> min_customers, random_seed)"]
+            ANALYZE_AFF["analyze_affinity()<br/>→ AffinityResult:<br/>  - associations (pairs)<br/>  - transitions (next-trip)<br/>  - diagnostics (status, budgets, coverage)"]
+            ANALYZE_APP["analyze_affinity_from_app()<br/>→ Streamlit-compatible dict"]
         end
 
-        subgraph FEATURES [features.py — Canonical Feature Builder]
-            FEAT_CONFIG["build_customer_snapshot()\n(windows_days, recent_window_days)"]
-            CORE["_core_customer_features()\n→ RFM, cadence, recency, regularity"]
-            WINDOWS["_window_features()\n→ rolling revenue/trips, recent-vs-prior"]
-            BREADTH["_breadth_features()\n→ distinct products/cats/depts, HHI"]
-            PROMO["_promo_features()\n→ promo_spend_share, price_index stats"]
-            CAT_AFF["_category_affinity_features()\n→ category spend shares, entropy"]
-            TRENDS["_trend_features()\n→ monthly slope, CV, active months\n  (includes zero-activity months)"]
-            BASKET_FEAT["_basket_composition_features()\n→ mean products/cats/units per trip"]
-            RETURNS["_return_features()\n→ return_value, unmatched_return_value"]
-            VALIDATE_FEAT["validate_feature_contract()\n→ REQUIRED_FEATURES + OPTIONAL_FEATURES"]
+        subgraph FEATURES["features.py — Canonical Feature Builder"]
+            FEAT_CONFIG["build_customer_snapshot()<br/>(windows_days, recent_window_days)"]
+            CORE["_core_customer_features()<br/>→ RFM, cadence, recency, regularity"]
+            WINDOWS["_window_features()<br/>→ rolling revenue/trips, recent-vs-prior"]
+            BREADTH["_breadth_features()<br/>→ distinct products/cats/depts, HHI"]
+            PROMO["_promo_features()<br/>→ promo_spend_share, price_index stats"]
+            CAT_AFF["_category_affinity_features()<br/>→ category spend shares, entropy"]
+            TRENDS["_trend_features()<br/>→ monthly slope, CV, active months<br/>  (includes zero-activity months)"]
+            BASKET_FEAT["_basket_composition_features()<br/>→ mean products/cats/units per trip"]
+            RETURNS["_return_features()<br/>→ return_value, unmatched_return_value"]
+            VALIDATE_FEAT["validate_feature_contract()<br/>→ REQUIRED_FEATURES + OPTIONAL_FEATURES"]
         end
 
-        INGESTION["ingestion.py\n(parse_dates, load_lines, clean_lines,\n structural_checks, prepare_transaction_frame,\n fmt_currency, fmt_number, fmt_pct)"]
+        INGESTION["ingestion.py<br/>(parse_dates, load_lines, clean_lines,<br/> structural_checks, prepare_transaction_frame,<br/> fmt_currency, fmt_number, fmt_pct)"]
     end
 
     %% ============================================================
     %% ORCHESTRATION ENTRY POINTS
     %% ============================================================
-    subgraph ENTRY [ORCHESTRATION ENTRY POINTS]
-        subgraph CLI [retail_customer_analysis.py — CLI Pipeline]
-            CLI_ARGS["argparse.Namespace\n(horizon_days, frequency_grain,\n transaction_key_mode, windows_days,\n rolling_origins, ...)"]
-            CLI_RUN["run_analysis()\n→ Orchestrates full pipeline"]
-            CLI_TRIPS["build_trips()\n  → events.build_purchase_events()"]
-            CLI_FEATS["build_customer_snapshot()\n  → features.build_customer_snapshot()"]
-            CLI_SCORE["score_customers()\n  (BG/NBD + Gamma-Gamma)"]
+    subgraph ENTRY["ORCHESTRATION ENTRY POINTS"]
+        subgraph CLI["retail_customer_analysis.py — CLI Pipeline"]
+            CLI_ARGS["argparse.Namespace<br/>(horizon_days, frequency_grain,<br/> transaction_key_mode, windows_days,<br/> rolling_origins, ...)"]
+            CLI_RUN["run_analysis()<br/>→ Orchestrates full pipeline"]
+            CLI_TRIPS["build_trips()<br/>  → events.build_purchase_events()"]
+            CLI_FEATS["build_customer_snapshot()<br/>  → features.build_customer_snapshot()"]
+            CLI_SCORE["score_customers()<br/>  (BG/NBD + Gamma-Gamma)"]
             CLI_RFM["assign_rfm()"]
-            CLI_CLUSTER["cluster_customers()\n  (K-means + stability)"]
-            CLI_AFF["basket_affinity()\n  → affinity.analyze_affinity()"]
+            CLI_CLUSTER["cluster_customers()<br/>  (K-means + stability)"]
+            CLI_AFF["basket_affinity()<br/>  → affinity.analyze_affinity()"]
             CLI_SURV["repeat_survival() + cohort_retention()"]
-            CLI_VALID["holdout_validation() /\n rolling_origin_validation()"]
+            CLI_VALID["holdout_validation() /<br/> rolling_origin_validation()"]
             CLI_WRITE["write_table() + write_report()"]
         end
 
-        subgraph APP [app.py — Streamlit Application]
-            APP_UPLOAD["st.file_uploader\n→ prepare_transaction_frame()"]
-            APP_PERIOD["get_period_context()\n→ period_params"]
-            APP_FEATS["build_customer_features()\n  → features.build_customer_snapshot()"]
-            APP_AFF["_compute_basket_analysis()\n  → affinity.analyze_affinity_from_app()"]
+        subgraph APP["app.py — Streamlit Application"]
+            APP_UPLOAD["st.file_uploader<br/>→ prepare_transaction_frame()"]
+            APP_PERIOD["get_period_context()<br/>→ period_params"]
+            APP_FEATS["build_customer_features()<br/>  → features.build_customer_snapshot()"]
+            APP_AFF["_compute_basket_analysis()<br/>  → affinity.analyze_affinity_from_app()"]
             APP_ACTIONS["Action generation from features"]
-            APP_CHARTS["insight_engine.py charts\n+ matplotlib helpers"]
+            APP_CHARTS["insight_engine.py charts<br/>+ matplotlib helpers"]
             APP_TABS["Tab renderers (00-15)"]
         end
 
-        subgraph INSIGHT [insight_engine.py — Reporting Engine]
-            INS_LOAD["load_results()\n→ reads all CSV artifacts"]
-            INS_CHARTS["chart_rules()\n→ generates all matplotlib figures"]
-            INS_KPIS["generate_kpis()\n→ KPI summary tables"]
-            INS_HTML["generate_html_report()\n→ standalone HTML dashboard"]
+        subgraph INSIGHT["insight_engine.py — Reporting Engine"]
+            INS_LOAD["load_results()<br/>→ reads all CSV artifacts"]
+            INS_CHARTS["chart_rules()<br/>→ generates all matplotlib figures"]
+            INS_KPIS["generate_kpis()<br/>→ KPI summary tables"]
+            INS_HTML["generate_html_report()<br/>→ standalone HTML dashboard"]
         end
     end
 
     %% ============================================================
     %% ANALYTICAL OUTPUTS
     %% ============================================================
-    subgraph OUTPUTS [ANALYTICAL OUTPUTS & ARTIFACTS]
-        subgraph CUSTOMER [Customer-Level Analytics]
-            CUST_FEATS["customer_features.csv\n(71+ columns per customer)"]
-            CUST_SCORED["Scored customers\n(P(alive), expected_trips,\n expected_revenue, prediction_source)"]
-            CUST_RFM["RFM segments\n(rfm_segment, rfm_score)"]
-            CUST_CLUSTER["Cluster assignments\n(cluster_id, cluster_label)"]
+    subgraph OUTPUTS["ANALYTICAL OUTPUTS & ARTIFACTS"]
+        subgraph CUSTOMER["Customer-Level Analytics"]
+            CUST_FEATS["customer_features.csv<br/>(71+ columns per customer)"]
+            CUST_SCORED["Scored customers<br/>(P(alive), expected_trips,<br/> expected_revenue, prediction_source)"]
+            CUST_RFM["RFM segments<br/>(rfm_segment, rfm_score)"]
+            CUST_CLUSTER["Cluster assignments<br/>(cluster_id, cluster_label)"]
         end
 
-        subgraph PRODUCT [Product/Category Analytics]
-            PROD_SUM["product_summary.csv\n(revenue, orders, units, repeat rate)"]
+        subgraph PRODUCT["Product/Category Analytics"]
+            PROD_SUM["product_summary.csv<br/>(revenue, orders, units, repeat rate)"]
             CAT_SUM["category_summary.csv"]
             DEPT_SUM["department_summary.csv"]
-            BASKET_AFF["basket_affinity.csv\n(support, confidence, lift, odds_ratio,\n q_value_bh, persistence)"]
-            NEXT_TRIP["next_trip_affinity.csv\n(transition probabilities)"]
+            BASKET_AFF["basket_affinity.csv<br/>(support, confidence, lift, odds_ratio,<br/> q_value_bh, persistence)"]
+            NEXT_TRIP["next_trip_affinity.csv<br/>(transition probabilities)"]
         end
 
-        subgraph TEMPORAL [Temporal & Validation]
-            HOLDOUT["holdout_metrics.csv\n(MAE, RMSE, WAPE, Spearman, AUC)"]
-            CALIB["holdout_calibration.csv\n(decile calibration)"]
-            ROLLING["Rolling-origin metrics\n(per-origin + aggregate)"]
-            SURVIVAL["repeat_survival.csv\n(Kaplan-Meier + CI)"]
+        subgraph TEMPORAL["Temporal & Validation"]
+            HOLDOUT["holdout_metrics.csv<br/>(MAE, RMSE, WAPE, Spearman, AUC)"]
+            CALIB["holdout_calibration.csv<br/>(decile calibration)"]
+            ROLLING["Rolling-origin metrics<br/>(per-origin + aggregate)"]
+            SURVIVAL["repeat_survival.csv<br/>(Kaplan-Meier + CI)"]
             COHORT["cohort_retention_new_customers.csv"]
             INTERPURCH["interpurchase_intervals.csv"]
         end
 
-        subgraph SEGMENT [Segmentation & Diagnostics]
-            CLUSTER_DIAG["cluster_diagnostics.csv\n(silhouette, ARI, stability)"]
-            CLUSTER_PROF["cluster_profiles.csv\n(medians, totals per cluster)"]
+        subgraph SEGMENT["Segmentation & Diagnostics"]
+            CLUSTER_DIAG["cluster_diagnostics.csv<br/>(silhouette, ARI, stability)"]
+            CLUSTER_PROF["cluster_profiles.csv<br/>(medians, totals per cluster)"]
             RFM_CLUSTER["rfm_cluster_comparison.csv"]
-            CLUSTER_STAB["cluster_stability.csv\n(cross-snapshot ARI)"]
+            CLUSTER_STAB["cluster_stability.csv<br/>(cross-snapshot ARI)"]
         end
 
-        subgraph QUALITY [Data Quality & Metadata]
-            DQ_JSON["data_quality.json\n(issue_counts, exclusions, accounting)"]
+        subgraph QUALITY["Data Quality & Metadata"]
+            DQ_JSON["data_quality.json<br/>(issue_counts, exclusions, accounting)"]
             DQ_ISSUES["data_quality_issues.csv"]
-            RUN_META["run_metadata.json\n(config, seed, versions, schemas)"]
-            MODEL_PARAMS["model_parameters.csv\n(BG/NBD, Gamma-Gamma params)"]
-            REPORT_MD["analysis_report.md\n(human-readable summary)"]
-            REPORT_HTML["analysis_report.html\n(interactive dashboard)"]
+            RUN_META["run_metadata.json<br/>(config, seed, versions, schemas)"]
+            MODEL_PARAMS["model_parameters.csv<br/>(BG/NBD, Gamma-Gamma params)"]
+            REPORT_MD["analysis_report.md<br/>(human-readable summary)"]
+            REPORT_HTML["analysis_report.html<br/>(interactive dashboard)"]
         end
     end
 
@@ -138,7 +138,7 @@ flowchart TD
     NORMALIZE --> AFF_CONFIG
     AFF_CONFIG --> ANALYZE_AFF
     AFF_CONFIG --> ANALYZE_APP
-    BUILD_BASKETS -.->|"used internally"| ANALYZE_AFF
+    BUILD_BASKETS -.->|used internally| ANALYZE_AFF
 
     NORMALIZE --> FEAT_CONFIG
     BUILD_TRIPS --> FEAT_CONFIG
@@ -222,12 +222,12 @@ flowchart TD
     CLI_WRITE --> MODEL_PARAMS
     CLI_WRITE --> REPORT_MD
 
-    APP_TABS -.->|"displays"| CUST_FEATS
-    APP_TABS -.->|"displays"| PROD_SUM
-    APP_TABS -.->|"displays"| BASKET_AFF
-    APP_TABS -.->|"displays"| HOLDOUT
-    INS_HTML -.->|"contains"| INS_CHARTS
-    INS_HTML -.->|"contains"| INS_KPIS
+    APP_TABS -.->|displays| CUST_FEATS
+    APP_TABS -.->|displays| PROD_SUM
+    APP_TABS -.->|displays| BASKET_AFF
+    APP_TABS -.->|displays| HOLDOUT
+    INS_HTML -.->|contains| INS_CHARTS
+    INS_HTML -.->|contains| INS_KPIS
 
     %% ============================================================
     %% STYLING
